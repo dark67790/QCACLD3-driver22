@@ -79,18 +79,11 @@ jobs:
         run: |
           python3 patches/apply_injection_patch.py
 
-      - name: DEBUG dump tx_rx.c relocation context
+      - name: DEBUG dump hunk body for __hdd_hard_start_xmit
         run: |
-          echo "--- all hunk headers for wlan_hdd_tx_rx.c ---"
-          NEXT_DIFF=$(awk 'NR>9759 && /^diff --git/{print NR; exit}' patches/07_packet_injection.patch)
-          echo "file diff section: 9759 to ${NEXT_DIFF:-EOF}"
-          sed -n "9759,${NEXT_DIFF:-\$}p" patches/07_packet_injection.patch | grep -n "^@@"
-
-          echo "--- current __hdd_hard_start_xmit body (real tree) ---"
-          sed -n '1205,1270p' vendor/qcom/opensource/wlan/qcacld-3.0/core/hdd/src/wlan_hdd_tx_rx.c
-
-          echo "--- exact misplaced block with full enclosing function (real tree) ---"
-          sed -n '2110,2150p' vendor/qcom/opensource/wlan/qcacld-3.0/core/hdd/src/wlan_hdd_tx_rx.c
+          sed -n '9920,9960p' patches/07_packet_injection.patch
+          echo "--- a bit more current real-tree context past line 1270 ---"
+          sed -n '1270,1310p' vendor/qcom/opensource/wlan/qcacld-3.0/core/hdd/src/wlan_hdd_tx_rx.c
 
       - name: DEBUG dump ant_div policy array context
         run: |

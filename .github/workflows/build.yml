@@ -79,6 +79,15 @@ jobs:
         run: |
           python3 patches/apply_injection_patch.py
 
+      - name: DEBUG dump ant_div policy array context
+        run: |
+          echo "--- where is the ANT_DIV_* enum defined, and what's the MAX/bound constant? ---"
+          grep -rn "QCA_WLAN_VENDOR_ATTR_CONFIG_ANT_DIV_PROBE_COUNT_WLAN\b" --include=*.h .
+          grep -rn "QCA_WLAN_VENDOR_ATTR_CONFIG_MAX\b" --include=*.h .
+          echo "--- the array declaration + full initializer block ---"
+          grep -n "QCA_WLAN_VENDOR_ATTR_CONFIG_ANT_DIV_PROBE_COUNT_WLAN" vendor/qcom/opensource/wlan/qcacld-3.0/core/hdd/src/wlan_hdd_cfg80211.c
+          sed -n '7260,7335p' vendor/qcom/opensource/wlan/qcacld-3.0/core/hdd/src/wlan_hdd_cfg80211.c
+
       - name: Prepare kernel headers for external module
         working-directory: kernel_platform
         run: |
@@ -119,7 +128,7 @@ jobs:
           ./build/build.sh
 
           test -f out/qcacld3/msm-kernel/.config
-          touch out/qcacld3/msm-kernel/Module.symvers
+          touch out/qcacld3/dist/Module.symvers
 
       - name: Build QCACLD3 only
         working-directory: kernel_platform
@@ -160,7 +169,7 @@ jobs:
 
           OUT_DIR="$GITHUB_WORKSPACE/kernel_platform/out/qcacld3-module" \
           BUILD_CONFIG=build.config.qcacld3-module \
-          KERNEL_KIT="$GITHUB_WORKSPACE/kernel_platform/out/qcacld3/msm-kernel" \
+          KERNEL_KIT="$GITHUB_WORKSPACE/kernel_platform/out/qcacld3" \
           ./build/build_module.sh
 
           MODULE="$(find "$GITHUB_WORKSPACE" -type f -path '*/qcacld-3.0/wlan.ko' -print -quit)"

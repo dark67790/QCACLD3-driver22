@@ -167,10 +167,14 @@ jobs:
           unset ANDROID_BUILD_TOP
           CONFIG
 
+          set +e
           OUT_DIR="$GITHUB_WORKSPACE/kernel_platform/out/qcacld3-module" \
           BUILD_CONFIG=build.config.qcacld3-module \
           KERNEL_KIT="$GITHUB_WORKSPACE/kernel_platform/out/qcacld3" \
-          ./build/build_module.sh
+          ./build/build_module.sh 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+          BUILD_RC=${PIPESTATUS[0]}
+          set -e
+          [ "$BUILD_RC" -eq 0 ] || exit "$BUILD_RC"
 
           MODULE="$(find "$GITHUB_WORKSPACE" -type f -path '*/qcacld-3.0/wlan.ko' -print -quit)"
           if [ -z "$MODULE" ]; then
@@ -199,6 +203,14 @@ jobs:
             exit 1
           fi
           ls -lh "$GITHUB_WORKSPACE/wlan.ko"
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qcacld3-build-log
+          path: build.log
+          if-no-files-found: ignore
 
       - name: Upload wlan.ko
         uses: actions/upload-artifact@v4

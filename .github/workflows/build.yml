@@ -87,22 +87,13 @@ jobs:
           path: injection_patch_report.log
           if-no-files-found: ignore
 
-      - name: DEBUG dump WMA_LOGE context
+      - name: DEBUG dump WMA_LOG family scope
         run: |
-          echo "--- WMA_LOGE occurrences in the patch itself ---"
-          grep -n "WMA_LOGE" patches/07_packet_injection.patch
+          echo "--- full legacy WMA_LOG* macro family used in the patch ---"
+          grep -on "WMA_LOG[A-Za-z0-9_]*" patches/07_packet_injection.patch | sort -u -t: -k2
 
-          echo "--- WMA_LOGE occurrences anywhere in the real tree after patching ---"
-          grep -rn "WMA_LOGE" vendor/qcom/opensource/wlan/qcacld-3.0/ 2>/dev/null
-
-          echo "--- modern wma logging calls already in use nearby ---"
-          grep -n "wma_err(\|wma_alert(\|wma_nofl_err(\|wma_debug(\|wma_info(\|wma_warn(" vendor/qcom/opensource/wlan/qcacld-3.0/core/wma/src/wma_main.c | head -40
-
-          echo "--- where those macros are defined ---"
-          grep -rn "define wma_err\|define wma_alert\|define wma_debug\|define wma_info\|define wma_warn" vendor/qcom/opensource/wlan/qcacld-3.0/core/wma/inc/*.h 2>/dev/null
-
-          echo "--- top of wma_main.c (includes) ---"
-          sed -n '1,45p' vendor/qcom/opensource/wlan/qcacld-3.0/core/wma/src/wma_main.c
+          echo "--- wma_frame_inject.c top-of-file includes ---"
+          sed -n '1,40p' vendor/qcom/opensource/wlan/qcacld-3.0/core/wma/src/wma_frame_inject.c
 
       - name: DEBUG dump ant_div policy array context
         run: |

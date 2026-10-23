@@ -79,6 +79,14 @@ jobs:
         run: |
           python3 patches/apply_injection_patch.py
 
+      - name: DEBUG dump tx_rx.c context
+        run: |
+          echo "--- include block ---"
+          sed -n '1,40p' vendor/qcom/opensource/wlan/qcacld-3.0/core/hdd/src/wlan_hdd_tx_rx.c
+          echo "--- region around dev/adapter/skb debug block ---"
+          grep -n "hdd_monitor_mode_tx_inject\|xmit_probe_logged\|is_monitor_tx_dev" vendor/qcom/opensource/wlan/qcacld-3.0/core/hdd/src/wlan_hdd_tx_rx.c
+          sed -n '2060,2170p' vendor/qcom/opensource/wlan/qcacld-3.0/core/hdd/src/wlan_hdd_tx_rx.c
+
       - name: DEBUG dump ant_div policy array context
         run: |
           echo "--- where is the ANT_DIV_* enum defined, and what's the MAX/bound constant? ---"

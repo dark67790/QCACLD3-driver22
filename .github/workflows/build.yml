@@ -87,16 +87,9 @@ jobs:
           path: injection_patch_report.log
           if-no-files-found: ignore
 
-      - name: DEBUG dump wma_utils.c resp context
+      - name: DEBUG dump del_bss_resp struct definition
         run: |
-          echo "--- function containing line 4657, with full declaration list ---"
-          sed -n '4600,4670p' vendor/qcom/opensource/wlan/qcacld-3.0/core/wma/src/wma_utils.c
-
-          echo "--- patch's own hunk header(s) for wma_utils.c ---"
-          grep -n "^diff --git.*wma_utils\|^@@" patches/07_packet_injection.patch
-
-          echo "--- any 'resp' declaration or del_bss/down response struct type in the patch ---"
-          grep -n "resp\b" patches/07_packet_injection.patch | grep -i "struct\|del_bss\|down_rsp\|vdev_down"
+          grep -rn "struct del_bss_resp\b" vendor/qcom/opensource/wlan/qcacld-3.0/ vendor/qcom/opensource/wlan/qca-wifi-host-cmn/ 2>/dev/null | grep -v wma_utils.c
 
       - name: DEBUG dump ant_div policy array context
         run: |

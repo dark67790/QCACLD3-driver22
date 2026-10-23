@@ -1,0 +1,17 @@
+# Generated kernel/module build output
+/out/
+/kernel_platform/
+/vendor/
+*.ko
+*.o
+*.a
+*.mod
+*.mod.c
+*.symvers
+Module.symvers
+modules.order
+
+# Downloaded build inputs
+*.zip
+*.tar
+*.tar.gz

@@ -1,0 +1,200 @@
+name: Build QCACLD3 WLAN module
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build QCACLD3 wlan.ko
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            bc bison flex libssl-dev libelf-dev libncurses-dev dwarves rsync \
+            python3-pip unzip git patch coreutils curl perl \
+            build-essential cpio wget zip llvm
+
+      - name: Download Samsung source and toolchain
+        env:
+          SRC_ID: "1bdcORqw9c05eGFMFo6nCrfgwcHXDiMN7"
+          TC_ID: "1alFYynwVbV5YH6DZf30jmi0tHSZ2EmPw"
+        run: |
+          pip install -q -U gdown
+
+          dl() {
+            local id="$1" out="$2"
+            for attempt in 1 2 3; do
+              if gdown "$id" -O "$out"; then
+                return 0
+              fi
+              echo "Download attempt $attempt failed for $out; retrying in 60 seconds"
+              sleep 60
+            done
+            echo "Failed to download $out after 3 attempts"
+            return 1
+          }
+
+          dl "$SRC_ID" samsung.zip
+          dl "$TC_ID" toolchain.tar.gz
+
+          unzip -q samsung.zip
+          tar -xf Kernel.tar.gz
+          tar -xf Platform.tar.gz
+
+          # Samsung's header closes its include guard before the fallback
+          # TPC helpers, so repeated includes redefine those static inlines.
+          python3 - <<'PYTHON'
+          from pathlib import Path
+          header = Path("vendor/qcom/opensource/wlan/qcacld-3.0/components/mlme/core/inc/wlan_mlme_main.h")
+          source = header.read_text()
+          # Match the function declaration independent of its indentation.
+          import re
+          pattern = r"(struct qdf_mac_addr \*self_mac\);\n)#endif\n(#ifdef CONFIG_BAND_6GHZ\b)"
+          source, count = re.subn(pattern, r"\1\2", source, count=1)
+          if count != 1 or not source.endswith("#endif\n"):
+              raise SystemExit("Unexpected wlan_mlme_main.h layout")
+          source = source.rstrip() + "\n\n#endif /* _WLAN_MLME_MAIN_H_ */\n"
+          header.write_text(source)
+          PYTHON
+
+          rm samsung.zip Kernel.tar.gz Platform.tar.gz
+          tar -xzf toolchain.tar.gz -C kernel_platform/
+          rm toolchain.tar.gz
+
+          test -d vendor/qcom/opensource/wlan/qcacld-3.0
+          test -d vendor/qcom/opensource/wlan/qca-wifi-host-cmn
+
+      - name: Apply packet injection patch + tree-specific fixups
+        run: |
+          python3 patches/apply_injection_patch.py
+
+      - name: Prepare kernel headers for external module
+        working-directory: kernel_platform
+        run: |
+          cat > build.config.qcacld3-prepare <<'CONFIG'
+          KERNEL_DIR=./msm-kernel
+          VARIANT=gki
+          TARGET_BUILD_VARIANT=user
+          . ./msm-kernel/build.config.msm.waipio.sec
+          MAKE_GOALS="modules_prepare"
+          GKI_BUILD_CONFIG=
+          IN_KERNEL_MODULES=
+          BUILD_INITRAMFS=
+          BUILD_BOOT_IMG=
+          BUILD_VENDOR_DLKM=
+          KMI_ENFORCED=
+          KMI_SYMBOL_LIST=
+          ABI_DEFINITION=
+          MODULES_ORDER=
+          EXT_MODULES=
+          KBUILD_EXT_MODULES=
+          DIST_CMDS=
+          SKIP_CP_KERNEL_HDR=1
+          PRE_DEFCONFIG_CMDS=
+          POST_DEFCONFIG_CMDS=
+          DT_OVERLAY_SUPPORT=0
+          CONFIG_LITHIUM=y
+          CONFIG_CNSS_QCA6490=y
+          CONFIG_TARGET=msm.waipio
+          CONFIG_QCA_CLD_WLAN_PROFILE=qca6490
+          CONFIG_QCA_CLD_WLAN=m
+          CONFIG_QCA_WIFI_ISOC=0
+          CONFIG_QCA_WIFI_2_0=1
+          unset ANDROID_BUILD_TOP
+          CONFIG
+
+          OUT_DIR="$GITHUB_WORKSPACE/kernel_platform/out/qcacld3" \
+          BUILD_CONFIG=build.config.qcacld3-prepare \
+          ./build/build.sh
+
+          test -f out/qcacld3/msm-kernel/.config
+          touch out/qcacld3/dist/Module.symvers
+
+      - name: Build QCACLD3 only
+        working-directory: kernel_platform
+        run: |
+          cat > build.config.qcacld3-module <<'CONFIG'
+          KERNEL_DIR=./msm-kernel
+          VARIANT=gki
+          TARGET_BUILD_VARIANT=user
+          . ./msm-kernel/build.config.msm.waipio.sec
+          MAKE_GOALS="modules_prepare"
+          GKI_BUILD_CONFIG=
+          IN_KERNEL_MODULES=
+          BUILD_INITRAMFS=
+          BUILD_BOOT_IMG=
+          BUILD_VENDOR_DLKM=
+          KMI_ENFORCED=
+          KMI_SYMBOL_LIST=
+          ABI_DEFINITION=
+          MODULES_ORDER=
+          EXT_MODULES="../vendor/qcom/opensource/wlan/qcacld-3.0"
+          KBUILD_EXT_MODULES=
+          KBUILD_OPTIONS="KBUILD_MODPOST_WARN=1"
+          DIST_CMDS=
+          SKIP_CP_KERNEL_HDR=1
+          PRE_DEFCONFIG_CMDS=
+          POST_DEFCONFIG_CMDS=
+          DT_OVERLAY_SUPPORT=0
+          CONFIG_LITHIUM=y
+          CONFIG_CNSS_QCA6490=y
+          CONFIG_TARGET=msm.waipio
+          CONFIG_QCA_CLD_WLAN_PROFILE=qca6490
+          CONFIG_QCA_CLD_WLAN=m
+          CONFIG_QCA_WIFI_ISOC=0
+          CONFIG_QCA_WIFI_2_0=1
+          CONFIG_FEATURE_FRAME_INJECTION_SUPPORT=y
+          unset ANDROID_BUILD_TOP
+          CONFIG
+
+          OUT_DIR="$GITHUB_WORKSPACE/kernel_platform/out/qcacld3-module" \
+          BUILD_CONFIG=build.config.qcacld3-module \
+          KERNEL_KIT="$GITHUB_WORKSPACE/kernel_platform/out/qcacld3" \
+          ./build/build_module.sh
+
+          MODULE="$(find "$GITHUB_WORKSPACE" -type f -path '*/qcacld-3.0/wlan.ko' -print -quit)"
+          if [ -z "$MODULE" ]; then
+            echo "wlan.ko was not produced"
+            exit 1
+          fi
+          cp "$MODULE" "$GITHUB_WORKSPACE/wlan.ko"
+          STRIP_TOOL="$(find "$GITHUB_WORKSPACE/kernel_platform/prebuilts" "$GITHUB_WORKSPACE/kernel_platform/prebuilts-master" \
+            \( -name llvm-strip -o -name 'llvm-strip-*' \) -print -quit 2>/dev/null || true)"
+          if [ -z "$STRIP_TOOL" ]; then
+            STRIP_TOOL="$(command -v llvm-strip || true)"
+          fi
+          if [ -z "$STRIP_TOOL" ]; then
+            STRIP_TOOL="$(find /usr/bin -maxdepth 1 \( -name llvm-strip -o -name 'llvm-strip-*' \) -print -quit)"
+          fi
+          if [ -z "$STRIP_TOOL" ]; then
+            echo "LLVM strip tool was not found"
+            exit 1
+          fi
+          ORIGINAL_SIZE="$(stat -c%s "$GITHUB_WORKSPACE/wlan.ko")"
+          "$STRIP_TOOL" --strip-debug "$GITHUB_WORKSPACE/wlan.ko"
+          STRIPPED_SIZE="$(stat -c%s "$GITHUB_WORKSPACE/wlan.ko")"
+          echo "Stripped wlan.ko: $ORIGINAL_SIZE -> $STRIPPED_SIZE bytes"
+          if [ "$STRIPPED_SIZE" -ge "$ORIGINAL_SIZE" ]; then
+            echo "Stripping did not reduce wlan.ko"
+            exit 1
+          fi
+          ls -lh "$GITHUB_WORKSPACE/wlan.ko"
+
+      - name: Upload wlan.ko
+        uses: actions/upload-artifact@v4
+        with:
+          name: qcacld3-wlan-ko
+          path: wlan.ko
+          if-no-files-found: error
+          compression-level: 6

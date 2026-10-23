@@ -87,13 +87,16 @@ jobs:
           path: injection_patch_report.log
           if-no-files-found: ignore
 
-      - name: DEBUG dump WMA_LOG family scope
+      - name: DEBUG dump wma_utils.c resp context
         run: |
-          echo "--- full legacy WMA_LOG* macro family used in the patch ---"
-          grep -on "WMA_LOG[A-Za-z0-9_]*" patches/07_packet_injection.patch | sort -u -t: -k2
+          echo "--- function containing line 4657, with full declaration list ---"
+          sed -n '4600,4670p' vendor/qcom/opensource/wlan/qcacld-3.0/core/wma/src/wma_utils.c
 
-          echo "--- wma_frame_inject.c top-of-file includes ---"
-          sed -n '1,40p' vendor/qcom/opensource/wlan/qcacld-3.0/core/wma/src/wma_frame_inject.c
+          echo "--- patch's own hunk header(s) for wma_utils.c ---"
+          grep -n "^diff --git.*wma_utils\|^@@" patches/07_packet_injection.patch
+
+          echo "--- any 'resp' declaration or del_bss/down response struct type in the patch ---"
+          grep -n "resp\b" patches/07_packet_injection.patch | grep -i "struct\|del_bss\|down_rsp\|vdev_down"
 
       - name: DEBUG dump ant_div policy array context
         run: |

@@ -860,6 +860,116 @@ def apply_hand_merges():
         "CONFIG_FEATURE_FRAME_INJECTION_SUPPORT := y\n",
         "default_defconfig injection flag")
 
+    # --- qca_vendor.h : the patch's antenna-diversity-probe hunk landed in
+    #     entirely the wrong enum. Its context was only "RX_NSS = 78," +
+    #     blank line before the insertion, and the generic "/* keep last */"
+    #     / AFTER_LAST / MAX idiom after it -- and that idiom repeats
+    #     verbatim across dozens of unrelated enums in this header. Under
+    #     --fuzz=2, patch dropped the (now-distant, since this tree's
+    #     enum qca_wlan_vendor_attr_config has grown well past RX_NSS=78
+    #     since the patch's baseline) trailing-context requirement and
+    #     spliced the six new attrs into the next "keep last" block it
+    #     found instead: enum qca_wlan_vendor_attr_acs_offload, right
+    #     after QCA_WLAN_VENDOR_ATTR_ACS_EHT_ENABLED = 19. Confirmed via
+    #     direct file dump in CI. This silently bloats acs_offload's own
+    #     MAX from 19 to 129 (harmless by itself today, nothing reads
+    #     those indices there -- but wrong, and worth not leaving in
+    #     place) while leaving qca_wlan_vendor_attr_config's own MAX at
+    #     81, which is what wlan_hdd_cfg80211.c's designated initializers
+    #     for these same six attrs then fail to fit inside.
+    #     Fix: cut the six-entry block out of acs_offload's tail and
+    #     splice it into config's own tail instead, right after its real
+    #     last member (QCA_WLAN_VENDOR_ATTR_CONFIG_ARP_NS_OFFLOAD = 81)
+    #     and before ITS "/* keep last */". Each entry keeps its explicit
+    #     value (124-129), so only the two AFTER_LAST/MAX pairs move:
+    #     config's 82/81 -> 130/129 (matching every nla_parse() site that
+    #     already reads _CONFIG_MAX), acs_offload's back down to 20/19. ---
+    f = WLAN_DIR / "qca-wifi-host-cmn/os_if/linux/qca_vendor.h"
+    six_entries_block = (
+        "\n"
+        "\t/* 16-bit unsigned value. For probing RSSI on other antennas, this\n"
+        "\t * attribute specifies the number of WLAN probes.\n"
+        "\t */\n"
+        "\tQCA_WLAN_VENDOR_ATTR_CONFIG_ANT_DIV_PROBE_COUNT_WLAN = 124,\n"
+        "\n"
+        "\t/* 16-bit unsigned value. For probing RSSI on other antennas, this\n"
+        "\t * attribute specifies the number of BT probes.\n"
+        "\t */\n"
+        "\tQCA_WLAN_VENDOR_ATTR_CONFIG_ANT_DIV_PROBE_COUNT_BT = 125,\n"
+        "\n"
+        "\t/* 16-bit unsigned value. This attribute specifies the WLAN RSSI\n"
+        "\t * threshold. The firmware will start to probe RSSI on other antenna\n"
+        "\t * if WLAN RSSI is lower than the threshold.\n"
+        "\t */\n"
+        "\tQCA_WLAN_VENDOR_ATTR_CONFIG_ANT_DIV_PROBE_WLAN_RSSI_THRESHOLD = 126,\n"
+        "\n"
+        "\t/* 16-bit unsigned value. This attribute specifies the BT RSSI\n"
+        "\t * threshold. The firmware will start to probe RSSI on other antenna\n"
+        "\t * if BT RSSI is lower than the threshold.\n"
+        "\t */\n"
+        "\tQCA_WLAN_VENDOR_ATTR_CONFIG_ANT_DIV_PROBE_BT_RSSI_THRESHOLD = 127,\n"
+        "\n"
+        "\t/* 16-bit unsigned value. This attribute specifies the WLAN RSSI\n"
+        "\t * difference. The firmware will select a better antenna if WLAN RSSI\n"
+        "\t * difference is larger than the value.\n"
+        "\t */\n"
+        "\tQCA_WLAN_VENDOR_ATTR_CONFIG_ANT_DIV_SWITCH_WLAN_RSSI_DIFF = 128,\n"
+        "\n"
+        "\t/* 16-bit unsigned value. This attribute specifies the BT RSSI\n"
+        "\t * difference. The firmware will select a better antenna if WLAN RSSI\n"
+        "\t * difference larger than the value.\n"
+        "\t */\n"
+        "\tQCA_WLAN_VENDOR_ATTR_CONFIG_ANT_DIV_SWITCH_BT_RSSI_DIFF = 129,\n"
+        "\n"
+    )
+    short_misplaced_marker = (
+        "QCA_WLAN_VENDOR_ATTR_ACS_EHT_ENABLED = 19,\n"
+        "\n"
+        "\t/* 16-bit unsigned value. For probing RSSI on other antennas, this\n"
+        "\t * attribute specifies the number of WLAN probes.")
+    short_fixed_marker = (
+        "QCA_WLAN_VENDOR_ATTR_CONFIG_ARP_NS_OFFLOAD = 81,\n"
+        "\n"
+        "\t/* 16-bit unsigned value. For probing RSSI on other antennas, this\n"
+        "\t * attribute specifies the number of WLAN probes.")
+
+    if already_present(f, short_fixed_marker):
+        print("[qca_vendor.h ant_div relocation] already in the correct "
+              "enum (qca_wlan_vendor_attr_config) -- skipping")
+    elif not already_present(f, short_misplaced_marker):
+        msg = ("[qca_vendor.h ant_div relocation] six-entry block not found "
+               "at its known-wrong location (acs_offload's tail) and not "
+               "found at the correct location either -- tree has drifted "
+               "further than expected, needs a human to re-check")
+        FAILURES.append(msg)
+        _diagnose(f, "QCA_WLAN_VENDOR_ATTR_CONFIG_ANT_DIV_PROBE_COUNT_WLAN")
+    else:
+        removed = fuzzy_replace(
+            f,
+            "\tQCA_WLAN_VENDOR_ATTR_ACS_EHT_ENABLED = 19,\n"
+            + six_entries_block +
+            "\t/* keep last */\n"
+            "\tQCA_WLAN_VENDOR_ATTR_ACS_AFTER_LAST,\n",
+            "\tQCA_WLAN_VENDOR_ATTR_ACS_EHT_ENABLED = 19,\n"
+            "\n"
+            "\t/* keep last */\n"
+            "\tQCA_WLAN_VENDOR_ATTR_ACS_AFTER_LAST,\n",
+            "qca_vendor.h remove ant_div block from acs_offload",
+            diagnose_needle="QCA_WLAN_VENDOR_ATTR_ACS_EHT_ENABLED = 19,")
+        if removed:
+            fuzzy_replace(
+                f,
+                "\tQCA_WLAN_VENDOR_ATTR_CONFIG_ARP_NS_OFFLOAD = 81,\n"
+                "\n"
+                "\t/* keep last */\n"
+                "\tQCA_WLAN_VENDOR_ATTR_CONFIG_AFTER_LAST,\n",
+                "\tQCA_WLAN_VENDOR_ATTR_CONFIG_ARP_NS_OFFLOAD = 81,\n"
+                + six_entries_block +
+                "\t/* keep last */\n"
+                "\tQCA_WLAN_VENDOR_ATTR_CONFIG_AFTER_LAST,\n",
+                "qca_vendor.h insert ant_div block into qca_wlan_vendor_attr_config",
+                diagnose_needle="QCA_WLAN_VENDOR_ATTR_CONFIG_ARP_NS_OFFLOAD = 81,")
+
     # --- tx_rx.c : wlan_hdd_netif_queue_control -- monitor-interface
     #     carrier/queue debug guard, after this tree's extra MLO
     #     hdd_adapter_is_link_adapter() guard ---

@@ -81,11 +81,14 @@ jobs:
 
       - name: DEBUG dump tx_rx.c context
         run: |
-          echo "--- include block ---"
-          sed -n '1,40p' vendor/qcom/opensource/wlan/qcacld-3.0/core/hdd/src/wlan_hdd_tx_rx.c
-          echo "--- region around dev/adapter/skb debug block ---"
-          grep -n "hdd_monitor_mode_tx_inject\|xmit_probe_logged\|is_monitor_tx_dev" vendor/qcom/opensource/wlan/qcacld-3.0/core/hdd/src/wlan_hdd_tx_rx.c
-          sed -n '2060,2170p' vendor/qcom/opensource/wlan/qcacld-3.0/core/hdd/src/wlan_hdd_tx_rx.c
+          echo "--- rest of include block ---"
+          sed -n '1,70p' vendor/qcom/opensource/wlan/qcacld-3.0/core/hdd/src/wlan_hdd_tx_rx.c
+          echo "--- candidate TX entry points in real tree ---"
+          grep -n "hard_start_xmit\|ndo_start_xmit\|netdev_tx_t\|WLAN_HDD_GET_PRIV_PTR(dev)" vendor/qcom/opensource/wlan/qcacld-3.0/core/hdd/src/wlan_hdd_tx_rx.c
+          echo "--- patch's own hunk for this file ---"
+          grep -n "^diff --git.*wlan_hdd_tx_rx\|^@@" patches/07_packet_injection.patch | grep -A2 "wlan_hdd_tx_rx"
+          echo "--- patch context around the injection check ---"
+          grep -n "xmit_probe_logged" patches/07_packet_injection.patch
 
       - name: DEBUG dump ant_div policy array context
         run: |

@@ -119,7 +119,7 @@ jobs:
           ./build/build.sh
 
           test -f out/qcacld3/msm-kernel/.config
-          touch out/qcacld3/dist/Module.symvers
+          touch out/qcacld3/msm-kernel/Module.symvers
 
       - name: Build QCACLD3 only
         working-directory: kernel_platform
@@ -160,7 +160,7 @@ jobs:
 
           OUT_DIR="$GITHUB_WORKSPACE/kernel_platform/out/qcacld3-module" \
           BUILD_CONFIG=build.config.qcacld3-module \
-          KERNEL_KIT="$GITHUB_WORKSPACE/kernel_platform/out/qcacld3" \
+          KERNEL_KIT="$GITHUB_WORKSPACE/kernel_platform/out/qcacld3/msm-kernel" \
           ./build/build_module.sh
 
           MODULE="$(find "$GITHUB_WORKSPACE" -type f -path '*/qcacld-3.0/wlan.ko' -print -quit)"

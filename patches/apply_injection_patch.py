@@ -970,6 +970,124 @@ def apply_hand_merges():
                 "qca_vendor.h insert ant_div block into qca_wlan_vendor_attr_config",
                 diagnose_needle="QCA_WLAN_VENDOR_ATTR_CONFIG_ARP_NS_OFFLOAD = 81,")
 
+    # --- tx_rx.c : radiotap include. The patch's own include-block hunk
+    #     (@@ -59,6 +59,9 @@, confirmed directly from the patch file) adds
+    #     the FEATURE_FRAME_INJECTION_SUPPORT guard for
+    #     wlan_hdd_frame_inject.h, but never adds an unconditional
+    #     #include <net/ieee80211_radiotap.h> anywhere. This tree already
+    #     has a conditional radiotap include further down:
+    #         #if defined(WLAN_SUPPORT_RX_FISA)
+    #         #include "dp_fisa_rx.h"
+    #         #else
+    #         #include <net/ieee80211_radiotap.h>
+    #         #endif
+    #     -- so in any build where WLAN_SUPPORT_RX_FISA is defined, that
+    #     #else branch is skipped and the injection code's use of struct
+    #     ieee80211_radiotap_header / ieee80211_get_radiotap_len() hits an
+    #     incomplete-type error (confirmed via live CI compile log). Add our
+    #     own unconditional include, guarded only by
+    #     FEATURE_FRAME_INJECTION_SUPPORT, right next to the include the
+    #     patch already added -- header guards make the (harmless) double
+    #     include under !WLAN_SUPPORT_RX_FISA builds a non-issue. ---
+    f = HDD_SRC / "wlan_hdd_tx_rx.c"
+    radiotap_include_tail = (
+        '#include "wlan_hdd_frame_inject.h"\n'
+        '#include <net/ieee80211_radiotap.h>\n#endif\n')
+    if already_present(f, radiotap_include_tail):
+        print("[tx_rx.c radiotap include] already present -- skipping")
+    else:
+        fuzzy_replace(
+            f,
+            '#ifdef FEATURE_FRAME_INJECTION_SUPPORT\n'
+            '#include "wlan_hdd_frame_inject.h"\n#endif\n',
+            '#ifdef FEATURE_FRAME_INJECTION_SUPPORT\n' + radiotap_include_tail,
+            "tx_rx.c radiotap include",
+            diagnose_needle='#include "wlan_hdd_frame_inject.h"')
+
+    # --- tx_rx.c : __hdd_hard_start_xmit -- xmit probe log + injection
+    #     check landed in the wrong function. The patch's own hunk header
+    #     (@@ -959,6 +1110,27 @@ static void __hdd_hard_start_xmit(struct
+    #     sk_buff *skb), confirmed directly from the patch file) proves this
+    #     block was authored against __hdd_hard_start_xmit, where dev, skb,
+    #     and adapter (= WLAN_HDD_GET_PRIV_PTR(dev)) are all in scope. Under
+    #     --fuzz=2 it spliced instead into hdd_register_rx_ol_cb(struct
+    #     hdd_context *hdd_ctx, bool wifi3_0_target) -- both functions
+    #     happen to have "void *soc = cds_get_context(QDF_MODULE_ID_SOC);"
+    #     as a declaration line followed by a blank line, and that's all
+    #     the surviving context needed to match under heavy fuzz once the
+    #     real distance to the patch's original anchor grew too large.
+    #     Confirmed via live CI: 'use of undeclared identifier dev/adapter/
+    #     skb' at exactly the lines this block occupies inside
+    #     hdd_register_rx_ol_cb, which only takes (hdd_ctx, wifi3_0_target)
+    #     and never has dev/adapter/skb in scope at all.
+    #     Fix: cut the block out of hdd_register_rx_ol_cb and splice it
+    #     into __hdd_hard_start_xmit, anchored on the same soc declaration
+    #     line but disambiguated from the other function's identical line
+    #     via what follows it in each case -- "if  (!hdd_ctx) {" (two
+    #     spaces, matches real tree) only in hdd_register_rx_ol_cb, "enum
+    #     qdf_proto_subtype subtype = QDF_PROTO_INVALID;" only in
+    #     __hdd_hard_start_xmit. ---
+    xmit_probe_block = (
+        "\tstatic bool xmit_probe_logged;\n"
+        "\n"
+        "\tif (!xmit_probe_logged) {\n"
+        "\t\thdd_warn(\"xmit probe: if=%s mode=%d iftype=%d dev_type=%u flags=0x%x len=%u mon_ctx=%u\",\n"
+        "\t\t\t dev ? dev->name : \"null\",\n"
+        "\t\t\t adapter ? adapter->device_mode : -1,\n"
+        "\t\t\t (dev && dev->ieee80211_ptr) ? dev->ieee80211_ptr->iftype : -1,\n"
+        "\t\t\t dev ? dev->type : 0,\n"
+        "\t\t\t dev ? dev->flags : 0,\n"
+        "\t\t\t skb ? skb->len : 0,\n"
+        "\t\t\t (adapter && adapter->injection_ctx &&\n"
+        "\t\t\t  adapter->injection_ctx->is_monitor_mode) ? 1 : 0);\n"
+        "\t\txmit_probe_logged = true;\n"
+        "\t}\n"
+        "\n"
+        "#ifdef FEATURE_FRAME_INJECTION_SUPPORT\n"
+        "\tif (hdd_is_monitor_tx_dev(adapter, dev)) {\n"
+        "\t\thdd_monitor_mode_tx_inject(adapter, dev, skb);\n"
+        "\t\treturn;\n"
+        "\t}\n"
+        "#endif\n"
+    )
+    xmit_probe_misplaced_marker = (
+        "\tvoid *soc = cds_get_context(QDF_MODULE_ID_SOC);\n"
+        + xmit_probe_block +
+        "\n\tif  (!hdd_ctx) {\n"
+    )
+    xmit_probe_fixed_marker = (
+        "\tvoid *soc = cds_get_context(QDF_MODULE_ID_SOC);\n"
+        + xmit_probe_block +
+        "\tenum qdf_proto_subtype subtype = QDF_PROTO_INVALID;\n"
+    )
+
+    if already_present(f, xmit_probe_fixed_marker):
+        print("[tx_rx.c xmit_probe relocation] already in "
+              "__hdd_hard_start_xmit -- skipping")
+    elif not already_present(f, xmit_probe_misplaced_marker):
+        msg = ("[tx_rx.c xmit_probe relocation] block not found at its "
+               "known-wrong location (hdd_register_rx_ol_cb) and not found "
+               "at the correct location either -- tree has drifted further "
+               "than expected, needs a human to re-check")
+        FAILURES.append(msg)
+        _diagnose(f, "xmit_probe_logged")
+    else:
+        removed = fuzzy_replace(
+            f,
+            xmit_probe_misplaced_marker,
+            "\tvoid *soc = cds_get_context(QDF_MODULE_ID_SOC);\n"
+            "\n\tif  (!hdd_ctx) {\n",
+            "tx_rx.c remove xmit_probe block from hdd_register_rx_ol_cb",
+            diagnose_needle="xmit_probe_logged")
+        if removed:
+            fuzzy_replace(
+                f,
+                "\tvoid *soc = cds_get_context(QDF_MODULE_ID_SOC);\n"
+                "\tenum qdf_proto_subtype subtype = QDF_PROTO_INVALID;\n",
+                xmit_probe_fixed_marker,
+                "tx_rx.c insert xmit_probe block into __hdd_hard_start_xmit",
+                diagnose_needle="enum qdf_proto_subtype subtype = QDF_PROTO_INVALID;")
+
     # --- tx_rx.c : wlan_hdd_netif_queue_control -- monitor-interface
     #     carrier/queue debug guard, after this tree's extra MLO
     #     hdd_adapter_is_link_adapter() guard ---
@@ -1026,6 +1144,23 @@ def cleanup():
               f"(see FAILED list below if any were never addressed)")
 
 
+def write_error_report():
+    """Write this run's outcome to a fixed, predictable path so CI can
+    archive it as a build artifact (via upload-artifact + if: always())
+    regardless of exit code. The terminal log is easy to lose or truncate
+    on a long build; this file isn't, and it's a stable target to wire an
+    upload step to without having to touch this script again later."""
+    report_path = REPO_ROOT / "injection_patch_report.log"
+    lines = []
+    if FAILURES:
+        lines.append(f"FAILED: {len(FAILURES)} hand-merge fix(es) did not apply:")
+        lines.extend(f"  - {msg}" for msg in FAILURES)
+    else:
+        lines.append("All hunks applied or hand-merged successfully.")
+    report_path.write_text("\n".join(lines) + "\n")
+    print(f"\n[error report] wrote {report_path.relative_to(REPO_ROOT)}")
+
+
 def main():
     run_bulk_patch()
     dump_rejects()
@@ -1033,6 +1168,7 @@ def main():
     check_unaddressed_rejects()
     scan_for_duplicate_functions()
     cleanup()
+    write_error_report()
 
     print("\n" + "=" * 60)
     if FAILURES:

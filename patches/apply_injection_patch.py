@@ -1021,12 +1021,25 @@ def apply_hand_merges():
     #     hdd_register_rx_ol_cb, which only takes (hdd_ctx, wifi3_0_target)
     #     and never has dev/adapter/skb in scope at all.
     #     Fix: cut the block out of hdd_register_rx_ol_cb and splice it
-    #     into __hdd_hard_start_xmit, anchored on the same soc declaration
-    #     line but disambiguated from the other function's identical line
-    #     via what follows it in each case -- "if  (!hdd_ctx) {" (two
-    #     spaces, matches real tree) only in hdd_register_rx_ol_cb, "enum
-    #     qdf_proto_subtype subtype = QDF_PROTO_INVALID;" only in
-    #     __hdd_hard_start_xmit. ---
+    #     into __hdd_hard_start_xmit -- anchored on the END of the
+    #     function's declaration list (now "int cpu =
+    #     qdf_get_smp_processor_id();", the last declaration before
+    #     "#ifdef QCA_WIFI_FTM" in the current tree), not on an arbitrary
+    #     declaration line in the middle of the list. The patch's own hunk
+    #     context confirms this -- its post-context shows "#ifdef
+    #     QCA_WIFI_FTM" as the line immediately following the inserted
+    #     block in its original baseline, where "void *soc = ...;" WAS the
+    #     last declaration. This tree has since grown that declaration list
+    #     (subtype, is_eapol, is_dhcp, stats, cpu all came later), but the
+    #     adjacency to "#ifdef QCA_WIFI_FTM" is still the real anchor.
+    #     (An earlier version of this fix anchored on "void *soc = ...;"
+    #     instead and inserted a statement block ahead of later
+    #     declarations -- compiles clean with GCC by default but fails
+    #     under this kernel's -Wdeclaration-after-statement, confirmed via
+    #     live CI: "ISO C90 forbids mixing declarations and code" pointing
+    #     at the now-downstream "enum qdf_proto_subtype subtype = ...;".
+    #     Inserting after the LAST declaration avoids this categorically,
+    #     matching the patch's actual original intent.) ---
     xmit_probe_block = (
         "\tstatic bool xmit_probe_logged;\n"
         "\n"
@@ -1055,10 +1068,15 @@ def apply_hand_merges():
         + xmit_probe_block +
         "\n\tif  (!hdd_ctx) {\n"
     )
+    # Anchored on the END of __hdd_hard_start_xmit's declaration list (the
+    # last declaration, "int cpu = ...;", immediately followed by "#ifdef
+    # QCA_WIFI_FTM") -- see comment above for why, after the
+    # -Wdeclaration-after-statement failure on an earlier mid-declaration
+    # anchor.
+    xmit_probe_decl_end = "\tint cpu = qdf_get_smp_processor_id();\n"
+    xmit_probe_ftm_guard = "\n#ifdef QCA_WIFI_FTM\n"
     xmit_probe_fixed_marker = (
-        "\tvoid *soc = cds_get_context(QDF_MODULE_ID_SOC);\n"
-        + xmit_probe_block +
-        "\tenum qdf_proto_subtype subtype = QDF_PROTO_INVALID;\n"
+        xmit_probe_decl_end + xmit_probe_block + xmit_probe_ftm_guard
     )
 
     if already_present(f, xmit_probe_fixed_marker):
@@ -1082,11 +1100,11 @@ def apply_hand_merges():
         if removed:
             fuzzy_replace(
                 f,
-                "\tvoid *soc = cds_get_context(QDF_MODULE_ID_SOC);\n"
-                "\tenum qdf_proto_subtype subtype = QDF_PROTO_INVALID;\n",
+                xmit_probe_decl_end + xmit_probe_ftm_guard,
                 xmit_probe_fixed_marker,
-                "tx_rx.c insert xmit_probe block into __hdd_hard_start_xmit",
-                diagnose_needle="enum qdf_proto_subtype subtype = QDF_PROTO_INVALID;")
+                "tx_rx.c insert xmit_probe block into __hdd_hard_start_xmit "
+                "(after last declaration, before first statement)",
+                diagnose_needle="int cpu = qdf_get_smp_processor_id();")
 
     # --- tx_rx.c : wlan_hdd_netif_queue_control -- monitor-interface
     #     carrier/queue debug guard, after this tree's extra MLO

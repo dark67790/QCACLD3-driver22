@@ -79,6 +79,14 @@ jobs:
         run: |
           python3 patches/apply_injection_patch.py
 
+      - name: Upload patch report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: injection-patch-report
+          path: injection_patch_report.log
+          if-no-files-found: ignore
+
       - name: DEBUG dump hunk body for __hdd_hard_start_xmit
         run: |
           sed -n '9920,9960p' patches/07_packet_injection.patch

@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 """
 apply_injection_patch.py
@@ -42,6 +43,7 @@ QCACLD = WLAN_DIR / "qcacld-3.0"
 HDD_SRC = QCACLD / "core/hdd/src"
 HDD_INC = QCACLD / "core/hdd/inc"
 WMA_SRC = QCACLD / "core/wma/src"
+WMA_INC = QCACLD / "core/wma/inc"
 CONFIGS = QCACLD / "configs"
 PATCH_FILE = Path(__file__).resolve().parent / "07_packet_injection.patch"
 
@@ -718,6 +720,63 @@ def apply_hand_merges():
         "\t\t\t\t\t  PLD_BUS_WIDTH_VERY_HIGH);\n\n"
         "\treturn 0;\n}",
         "main.c __hdd_mon_open")
+
+    # --- wma.h : legacy WMA_LOGE/W/D/I macro compatibility shim. The
+    #     patch was authored against an older baseline where this family
+    #     was still the logging convention in core/wma/src/*.c -- confirmed
+    #     by context lines in the patch itself (e.g. the unchanged
+    #     "WMA_LOGE(...)" line around the Tx-complete-callback check) that
+    #     no longer match this tree's actual content there at all (this
+    #     tree already reads wma_err()/wma_warn()/etc. at those spots,
+    #     confirmed via live grep -- the module-wide rename predates this
+    #     patch and is unrelated to it). WMA_LOGE itself is not defined
+    #     ANYWHERE in this tree (confirmed via a repo-wide grep turning up
+    #     zero #define sites), so every "+" line the patch adds using it
+    #     is an implicit-function-declaration compile error, confirmed via
+    #     live CI across all three files that carry it: the new
+    #     wma_frame_inject.c (7 call sites, confirmed to #include "wma.h"
+    #     as its first header), plus one hand-merged call each in
+    #     wma_main.c (this fix, below) and wma_mgmt.c (landed via the bulk
+    #     patch step, no hand-merge needed). Fixing each call site
+    #     individually can't be fully verified in one CI round-trip since
+    #     parallel make aborts after the first failures, so a build might
+    #     not even reach every file that has the problem yet -- one
+    #     compatibility shim in wma.h, right next to the real wma_err/
+    #     wma_warn/wma_debug/wma_info definitions it maps onto, reaches
+    #     every file that already #include "wma.h" (which every WMA-layer
+    #     source file in this patch does) regardless of how far the build
+    #     gets. WMA_LOGW/D/I are included too even though only WMA_LOGE is
+    #     confirmed to land in compiled code -- the mapping itself is
+    #     fully grounded (wma.h's own real macros, same params... call
+    #     convention), so including the other three is a zero-risk hedge,
+    #     not a guess. ---
+    f = WMA_INC / "wma.h"
+    wma_log_macros = (
+        "#define wma_alert(params...) QDF_TRACE_FATAL(QDF_MODULE_ID_WMA, params)\n"
+        "#define wma_err(params...) QDF_TRACE_ERROR(QDF_MODULE_ID_WMA, params)\n"
+        "#define wma_warn(params...) QDF_TRACE_WARN(QDF_MODULE_ID_WMA, params)\n"
+        "#define wma_info(params...) QDF_TRACE_INFO(QDF_MODULE_ID_WMA, params)\n"
+        "#define wma_debug(params...) QDF_TRACE_DEBUG(QDF_MODULE_ID_WMA, params)\n"
+        "#define wma_debug_rl(params...) QDF_TRACE_DEBUG_RL(QDF_MODULE_ID_WMA, params)\n"
+        "#define wma_err_rl(params...) QDF_TRACE_ERROR_RL(QDF_MODULE_ID_WMA, params)\n"
+    )
+    wma_legacy_shim = (
+        "#ifdef FEATURE_FRAME_INJECTION_SUPPORT\n"
+        "/* 07_packet_injection.patch was authored against a baseline that\n"
+        " * still used the legacy WMA_LOG* macro family; this tree has since\n"
+        " * moved to wma_err()/wma_warn()/etc. and no longer defines them. */\n"
+        "#define WMA_LOGE(params...) wma_err(params)\n"
+        "#define WMA_LOGW(params...) wma_warn(params)\n"
+        "#define WMA_LOGD(params...) wma_debug(params)\n"
+        "#define WMA_LOGI(params...) wma_info(params)\n"
+        "#endif\n"
+    )
+    if already_present(f, "#define WMA_LOGE(params...) wma_err(params)"):
+        print("[wma.h legacy log macro shim] already present -- skipping")
+    else:
+        fuzzy_replace(f, wma_log_macros, wma_log_macros + wma_legacy_shim,
+                      "wma.h legacy WMA_LOGE/W/D/I shim",
+                      diagnose_needle="#define wma_err_rl(params...)")
 
     # --- wma_main.c : wma_open -- inject queue init, after this tree's
     #     extra wma_trace_init() call ---

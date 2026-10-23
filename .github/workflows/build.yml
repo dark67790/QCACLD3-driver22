@@ -87,9 +87,13 @@ jobs:
           path: injection_patch_report.log
           if-no-files-found: ignore
 
-      - name: DEBUG dump del_bss_resp struct definition
+      - name: DEBUG dump del_bss_resp fields and wma_utils.c includes
         run: |
-          grep -rn "struct del_bss_resp\b" vendor/qcom/opensource/wlan/qcacld-3.0/ vendor/qcom/opensource/wlan/qca-wifi-host-cmn/ 2>/dev/null | grep -v wma_utils.c
+          echo "--- struct del_bss_resp definition ---"
+          sed -n '480,510p' vendor/qcom/opensource/wlan/qcacld-3.0/components/mlme/core/inc/wlan_mlme_main.h
+
+          echo "--- wma_utils.c top-of-file includes ---"
+          sed -n '1,40p' vendor/qcom/opensource/wlan/qcacld-3.0/core/wma/src/wma_utils.c | grep "#include"
 
       - name: DEBUG dump ant_div policy array context
         run: |

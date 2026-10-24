@@ -87,17 +87,11 @@ jobs:
           path: injection_patch_report.log
           if-no-files-found: ignore
 
-      - name: DEBUG verify inject_security.c fix landed
+      - name: DEBUG dump frame_inject.h vendor commands macro
         run: |
           set +e
-          echo "=== grep for the problem symbols in the ACTUAL tree used for this build ==="
-          grep -rn "get_task_cred\|put_cred\b\|kdp_usecount_dec_and_test" vendor/qcom/opensource/wlan/qcacld-3.0/core/ 2>/dev/null | grep -v "\.rej:"
-
-          echo "=== what hdd_check_injection_capability actually looks like right now ==="
-          grep -n "QDF_STATUS hdd_check_injection_capability" -A 30 vendor/qcom/opensource/wlan/qcacld-3.0/core/hdd/src/wlan_hdd_inject_security.c
-
-          echo "=== sanity check: does the script file in this repo even contain the v12 fix ==="
-          grep -n "remove dead get_task_cred" patches/apply_injection_patch.py
+          grep -n "define FEATURE_FRAME_INJECTION_VENDOR_COMMANDS" -A 24 \
+            vendor/qcom/opensource/wlan/qcacld-3.0/core/hdd/inc/wlan_hdd_frame_inject.h | cat -A
           exit 0
 
       - name: Prepare kernel headers for external module

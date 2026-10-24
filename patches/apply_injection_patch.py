@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 """
 apply_injection_patch.py
@@ -795,8 +794,48 @@ def apply_hand_merges():
         "\t}\n\n\treturn QDF_STATUS_SUCCESS;",
         "wma_main.c wma_open injection queue init")
 
-    # --- wma_utils.c : wma_mon_mlme_vdev_down_send -- del_bss_resp alloc ---
+    # --- wma_utils.c : wma_mon_mlme_vdev_down_send -- del_bss_resp alloc.
+    #     The patch's hunk for this function is actually TWO separate
+    #     hunks: one adding "struct del_bss_resp *resp;" at the top of the
+    #     function (@@ -4690,6 +4690,7 @@, a 1-line addition), and one
+    #     adding the resp=alloc/use block near the end (@@ -4703,10
+    #     +4704,15 @@). Only the second one had hand-merge logic in this
+    #     script -- the first was silently dropped as an unaddressed .rej
+    #     (the file was already in ATTEMPTED_FILES because of the second
+    #     hunk's fix, so check_unaddressed_rejects() never flagged it).
+    #     Confirmed via live CI: 'use of undeclared identifier resp' at
+    #     every use site below. struct del_bss_resp is a real, unrenamed
+    #     type (wlan_mlme_main.h, fields status/vdev_id -- matches what the
+    #     usage code assumes) and both wma_internal.h and wlan_mlme_main.h
+    #     are already included in this file, so only the local declaration
+    #     itself is missing.
+    #     Anchored on the function's own signature (unique -- the name
+    #     appears once) rather than the declaration list's text alone,
+    #     since wma_mon_mlme_vdev_stop_send() right above it has an
+    #     identical-looking 3-line declaration block that would otherwise
+    #     make the anchor ambiguous. Inserted as the LAST declaration,
+    #     before the function's first statement -- not right before its
+    #     point of use -- to avoid the exact -Wdeclaration-after-statement
+    #     class of bug already hit and fixed once this run in
+    #     __hdd_hard_start_xmit. ---
     f = WMA_SRC / "wma_utils.c"
+    down_send_decl_anchor = (
+        "QDF_STATUS wma_mon_mlme_vdev_down_send(struct vdev_mlme_obj *vdev_mlme,\n"
+        "\t\t\t\t       uint16_t data_len, void *data)\n"
+        "{\n"
+        "\tuint8_t vdev_id;\n"
+        "\ttp_wma_handle wma = cds_get_context(QDF_MODULE_ID_WMA);\n"
+        "\tQDF_STATUS status;\n"
+    )
+    if already_present(f, "struct del_bss_resp *resp;"):
+        print("[wma_utils.c del_bss_resp declaration] already present -- skipping")
+    else:
+        fuzzy_replace(
+            f, down_send_decl_anchor,
+            down_send_decl_anchor + "\tstruct del_bss_resp *resp;\n",
+            "wma_utils.c del_bss_resp declaration",
+            diagnose_needle="QDF_STATUS wma_mon_mlme_vdev_down_send(")
+
     fuzzy_replace(f,
         "\twlan_vdev_mlme_sm_deliver_evt(vdev_mlme->vdev,\n"
         "\t\t\t\t      WLAN_VDEV_SM_EV_DOWN_COMPLETE,\n"
@@ -1197,9 +1236,26 @@ def apply_hand_merges():
 
 
 def check_unaddressed_rejects():
-    """Flag any .rej whose target file has NO hand-merge logic at all in
-    this script, so an unknown divergence doesn't get silently wiped by
-    cleanup() and mistaken for a clean run."""
+    """Flag any .rej that looks unaddressed in the final tree.
+
+    Originally this only checked whether the target FILE had any
+    hand-merge logic at all (ATTEMPTED_FILES) -- but that's too coarse: a
+    file can have working hand-merge logic for one hunk while a SEPARATE
+    hunk against the same file is silently dropped, because the file being
+    in ATTEMPTED_FILES (for the first hunk) hid the second hunk's reject
+    from ever being flagged. This happened for real: wma_utils.c had
+    correct hand-merge logic for its resp=alloc/use hunk, but a separate,
+    earlier hunk adding "struct del_bss_resp *resp;" had none -- its .rej
+    was swept away by cleanup() unflagged, and the gap only surfaced as a
+    live CI compile failure ('use of undeclared identifier resp').
+
+    So beyond the file-level check, for every remaining .rej whose target
+    file DOES have other hand-merge logic, check whether this specific
+    reject's own added ("+") lines actually made it into the final file
+    somewhere (regardless of exact position -- hand-merged text may
+    legitimately differ in whitespace/surroundings from the literal
+    reject). If most of a reject's added content is nowhere in the file,
+    it's very likely a hunk nothing has ever actually handled."""
     for rej in sorted(WLAN_DIR.rglob("*.rej")):
         target = rej.with_suffix("").resolve()
         if target not in ATTEMPTED_FILES:
@@ -1207,6 +1263,30 @@ def check_unaddressed_rejects():
                 f"[unaddressed] {rej.relative_to(WLAN_DIR)} -- no hand-merge "
                 f"logic exists for this file yet, see dump_rejects() output "
                 f"above for ground truth"
+            )
+            continue
+        if not target.exists():
+            continue
+        rej_text = rej.read_text()
+        added_lines = [
+            l[1:].strip() for l in rej_text.split("\n")
+            if l.startswith("+") and not l.startswith("+++") and l[1:].strip()
+        ]
+        if not added_lines:
+            continue
+        target_text = target.read_text()
+        missing = [l for l in added_lines if l not in target_text]
+        # Slack for legitimately-reworded hand merges: only flag when a
+        # clear majority of THIS reject's added lines are nowhere in the
+        # file at all, not just absent at the reject's original position.
+        if len(missing) > len(added_lines) * 0.5:
+            FAILURES.append(
+                f"[unaddressed] {rej.relative_to(WLAN_DIR)} -- {target.name} "
+                f"has hand-merge logic for other hunks, but {len(missing)}/"
+                f"{len(added_lines)} of THIS reject's added lines are not "
+                f"present anywhere in the final file -- likely a hunk this "
+                f"script doesn't actually handle yet, see dump_rejects() "
+                f"output above for ground truth"
             )
 
 

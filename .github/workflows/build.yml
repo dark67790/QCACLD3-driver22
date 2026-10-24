@@ -76,7 +76,6 @@ jobs:
           test -d vendor/qcom/opensource/wlan/qca-wifi-host-cmn
 
       - name: Apply packet injection patch + tree-specific fixups
-        continue-on-error: true
         run: |
           python3 patches/apply_injection_patch.py
 
@@ -87,28 +86,6 @@ jobs:
           name: injection-patch-report
           path: injection_patch_report.log
           if-no-files-found: ignore
-
-      - name: DEBUG confirm connect-path architecture
-        run: |
-          set +e
-          F=vendor/qcom/opensource/wlan/qcacld-3.0/core/hdd/src/wlan_hdd_cfg80211.c
-
-          echo "=== any trace of the old functions at all? ==="
-          grep -n "wlan_hdd_cfg80211_connect_start\|wlan_hdd_cfg80211_join_ibss\|__wlan_hdd_cfg80211_connect\b\|hdd_dump_connect_req" "$F"
-
-          echo "=== what connect-manager style functions exist instead? ==="
-          grep -n "osif_cm_connect\|wlan_cm_start_connect\|osif_pre_cm_connect\|__wlan_hdd_cm_connect\|wlan_hdd_cm_connect" "$F" | head -20
-
-          exit 0
-
-      - name: DEBUG dump ant_div policy array context
-        run: |
-          echo "--- where is the ANT_DIV_* enum defined, and what's the MAX/bound constant? ---"
-          grep -rn "QCA_WLAN_VENDOR_ATTR_CONFIG_ANT_DIV_PROBE_COUNT_WLAN\b" --include=*.h .
-          grep -rn "QCA_WLAN_VENDOR_ATTR_CONFIG_MAX\b" --include=*.h .
-          echo "--- the array declaration + full initializer block ---"
-          grep -n "QCA_WLAN_VENDOR_ATTR_CONFIG_ANT_DIV_PROBE_COUNT_WLAN" vendor/qcom/opensource/wlan/qcacld-3.0/core/hdd/src/wlan_hdd_cfg80211.c
-          sed -n '7260,7335p' vendor/qcom/opensource/wlan/qcacld-3.0/core/hdd/src/wlan_hdd_cfg80211.c
 
       - name: Prepare kernel headers for external module
         working-directory: kernel_platform

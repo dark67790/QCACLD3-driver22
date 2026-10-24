@@ -27,6 +27,16 @@ tree-specific logic the patch's baseline never had):
   - Kbuild -Wmaybe-uninitialized / -Wframe-larger-than block (unrelated
     compiler-warning housekeeping)
 
+Confirmed NOT APPLICABLE (not drifted -- the targeted code no longer
+exists in this tree at all; see KNOWN_INAPPLICABLE_REJECTS for the full
+reasoning, kept there so it prints every run rather than being buried):
+  - cfg80211.c: 7 hunks touching the legacy STA/IBSS connect path
+    (wlan_hdd_cfg80211_connect_start, wlan_hdd_cfg80211_join_ibss,
+    __wlan_hdd_cfg80211_connect, hdd_dump_connect_req) -- this tree has
+    moved that flow to the Connection Manager architecture
+    (wlan_hdd_cm_connect) and none of those four functions exist here.
+    Unrelated to monitor mode / frame injection either way.
+
 Run from the repo root (the directory containing vendor/qcom/opensource/wlan).
 Exits non-zero on any failure so CI surfaces it instead of silently
 producing a half-patched tree.
@@ -38,11 +48,13 @@ from pathlib import Path
 
 # Bumped on every change shipped. Printed as the very first line of output
 # so a CI log makes it immediately, unambiguously obvious whether the repo
-# actually has the version being discussed -- "anchor not found" vs
-# "doc marker not present" are different code paths from different script
-# versions, and that mismatch is exactly what happened here: hard to tell
-# apart by error message alone, trivial to tell apart by this.
-SCRIPT_VERSION = "v11-wma_frame_inject-field-fixes"
+# actually has the version being discussed. v11 was shipped from a stale
+# sandbox copy that had regressed the get_channel fix back to a fragile
+# literal-body match -- this version (v12) restores the structural
+# brace-matching deletion (_delete_function_by_doc_marker) that v11
+# accidentally dropped, confirmed by direct inspection this time, not
+# assumption.
+SCRIPT_VERSION = "v12-restore-doc-marker-deletion"
 
 REPO_ROOT = Path.cwd()
 WLAN_DIR = REPO_ROOT / "vendor/qcom/opensource/wlan"
@@ -50,11 +62,45 @@ QCACLD = WLAN_DIR / "qcacld-3.0"
 HDD_SRC = QCACLD / "core/hdd/src"
 HDD_INC = QCACLD / "core/hdd/inc"
 WMA_SRC = QCACLD / "core/wma/src"
+WMA_INC = QCACLD / "core/wma/inc"
 CONFIGS = QCACLD / "configs"
 PATCH_FILE = Path(__file__).resolve().parent / "07_packet_injection.patch"
 
 FAILURES = []
 ATTEMPTED_FILES = set()  # files this script has any hand-merge logic for at all
+
+# .rej files confirmed (via live CI ground truth, not guessed) to contain
+# ONLY hunks that are genuinely not applicable to this tree -- not merely
+# drifted, but targeting code that no longer exists at all. The content
+# heuristic in check_unaddressed_rejects() can't distinguish "nothing
+# addresses this" from "this was investigated and found inapplicable", so
+# these are listed explicitly, with the reasoning kept here (and printed
+# every run) rather than silently assumed forever.
+KNOWN_INAPPLICABLE_REJECTS = {
+    "qcacld-3.0/core/hdd/src/wlan_hdd_cfg80211.c.rej": (
+        "7 of its 9 hunks target the legacy STA/IBSS connect path -- "
+        "wlan_hdd_cfg80211_connect_start(), wlan_hdd_cfg80211_join_ibss(), "
+        "__wlan_hdd_cfg80211_connect(), hdd_dump_connect_req() -- and "
+        "confirmed via live CI that NONE of those four names appear "
+        "anywhere in this file at all (not drifted -- entirely absent). "
+        "This tree's STA/IBSS connect flow has been replaced wholesale by "
+        "the Connection Manager architecture (wlan_hdd_cm_connect(), "
+        "confirmed present at the call site that used to invoke the old "
+        "functions). These 7 hunks are pre-existing upstream connect-flow "
+        "diagnostic-logging changes that happened to be bundled into the "
+        "same patch file as the packet-injection feature -- unrelated to "
+        "monitor mode or frame injection, which lives entirely in "
+        "__hdd_hard_start_xmit, hdd_is_monitor_tx_dev / "
+        "hdd_monitor_mode_tx_inject, wma_frame_inject.c, the qca_vendor.h "
+        "enums, wlan_hdd_rx_monitor.c, and the cfg80211 vendor-command "
+        "wiring -- all handled elsewhere in this script. There is no "
+        "equivalent code left to hand-merge these into. The other 2 "
+        "hunks in this same reject (the FEATURE_FRAME_INJECTION_SUPPORT "
+        "include guard and the vendor-command array entry) ARE applied, "
+        "via the 'cfg80211.c include' / 'cfg80211.c vendor cmd array' "
+        "fuzzy_replace calls in apply_hand_merges()."
+    ),
+}
 
 
 def run_bulk_patch():
@@ -306,6 +352,138 @@ def _mutually_exclusive(path_a, path_b):
     return any(a_map[bid] != b_map[bid] for bid in shared)
 
 
+def _find_matching_paren(text: str, open_idx: int) -> int:
+    """text[open_idx] must be '('. Returns the index of its matching ')',
+    tracking nesting depth, or -1 if unbalanced before EOF."""
+    depth = 0
+    i = open_idx
+    n = len(text)
+    while i < n:
+        if text[i] == "(":
+            depth += 1
+        elif text[i] == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return -1
+
+
+def _is_function_definition(text: str, open_paren_idx: int) -> bool:
+    """text[open_paren_idx] must be '('. A match is a genuine function
+    DEFINITION only if its parameter list's matching ')' is followed
+    (after only whitespace) by '{'. A call ends in ';' or ',' or ')'
+    inside a larger expression; a forward declaration ends in ';'.
+    Without this check, the duplicate-function scanner below false-flags
+    an ordinary call site (e.g. `hdd_monitor_mode_tx_inject(adapter, dev,
+    skb);`) as a second definition, since the scan regex only looks for
+    "name(" at the start of a non-comment line and doesn't care what
+    follows the closing paren."""
+    close_idx = _find_matching_paren(text, open_paren_idx)
+    if close_idx == -1:
+        return False
+    j = close_idx + 1
+    n = len(text)
+    while j < n and text[j] in " \t\r\n":
+        j += 1
+    return j < n and text[j] == "{"
+
+
+def _delete_function_by_doc_marker(path: Path, doc_marker: str, label: str) -> bool:
+    """Delete one complete function definition, located structurally
+    instead of by a literal transcription of its full body: find the
+    short, distinctive doc_marker inside its kernel-doc comment, walk
+    back to that comment's opening '/**', walk forward to the function's
+    opening '{', then brace-balance to the matching closing '}' and
+    delete everything from the comment through that brace (plus one
+    trailing blank line, if present).
+
+    This replaces a fragile literal-body fuzzy_replace for cases like
+    wlan_hdd_cfg80211_get_channel, where the body itself (not just its
+    surroundings) has already been shown to drift between snapshots --
+    a hand-transcribed anchor for the whole function keeps re-breaking
+    on each new divergence inside the body. Brace-matching is correct
+    regardless of what's inside, as long as the doc comment and a '{'
+    immediately following the signature are present -- true for every
+    kernel-doc-commented function in this codebase."""
+    ATTEMPTED_FILES.add(path.resolve())
+    if not path.exists():
+        FAILURES.append(f"[{label}] file not found: {path}")
+        return False
+
+    text = path.read_text()
+    marker_idx = text.find(doc_marker)
+    if marker_idx == -1:
+        print(f"[{label}] doc marker not present -- nothing to delete")
+        return False
+
+    comment_start = text.rfind("/**", 0, marker_idx)
+    if comment_start == -1:
+        FAILURES.append(
+            f"[{label}] found doc marker but no preceding '/**' in {path} "
+            f"-- refusing to guess, needs a human")
+        _diagnose(path, doc_marker)
+        return False
+
+    brace_open = text.find("{", marker_idx)
+    if brace_open == -1:
+        FAILURES.append(
+            f"[{label}] found doc marker but no following '{{' in {path} "
+            f"-- refusing to guess, needs a human")
+        _diagnose(path, doc_marker)
+        return False
+
+    brace_close = -1
+    depth = 0
+    i = brace_open
+    n = len(text)
+    while i < n:
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                brace_close = i
+                break
+        i += 1
+    if brace_close == -1:
+        FAILURES.append(
+            f"[{label}] opening brace at offset {brace_open} in {path} "
+            f"never balanced -- refusing to guess, needs a human")
+        return False
+
+    # Consume up to one trailing blank line after the closing brace so we
+    # don't leave a double blank line behind.
+    end = brace_close + 1
+    if text[end:end + 1] == "\n":
+        end += 1
+    if text[end:end + 1] == "\n":
+        end += 1
+
+    start_line = text.count("\n", 0, comment_start) + 1
+    end_line = text.count("\n", 0, end) + 1
+    new_text = text[:comment_start] + text[end:]
+    path.write_text(new_text)
+    print(f"[{label}] deleted function (lines {start_line}-{end_line}) -> "
+          f"{path.relative_to(REPO_ROOT)}")
+    return True
+
+
+def _diagnose_duplicate(path: Path, name: str, lines_list, context_lines: int = 24):
+    """Dump real context around each occurrence of a duplicated function name,
+    the same way _diagnose() does for a missed .rej anchor, so a genuine new
+    divergence (one this script has no hand-merge logic for yet) gets ground
+    truth in this run's log instead of requiring a guessed fix."""
+    lines = path.read_text().splitlines()
+    for ln in lines_list:
+        lo = max(0, ln - 1 - context_lines // 2)
+        hi = min(len(lines), ln - 1 + context_lines // 2)
+        print(f"    DIAGNOSE DUPLICATE '{name}' at line {ln} in {path.name} "
+              f"(showing {lo + 1}-{hi}):")
+        for i in range(lo, hi):
+            print(f"    {i + 1:>6}\t{lines[i].replace(chr(9), '<TAB>')}")
+
+
 def scan_for_duplicate_functions():
     """For the narrow, patch-derived list of function names (see
     get_patch_added_function_names), check whether the FINAL merged file
@@ -331,18 +509,25 @@ def scan_for_duplicate_functions():
         text = target.read_text()
         paths = _build_condition_paths(text)
         for name in sorted(names):
-            # (?![ \t]) requires true column-0 (excludes indented function
-            # CALLS, e.g. the patch's own call site hooking this into the
-            # TX path -- a call is not a definition and must not count).
-            # (?!\*)(?!/) excludes comment lines starting right at column 0.
-            # [\w \t\*] (not \s) keeps the flexible middle portion from
-            # crossing newlines, since \s matches '\n' too and would
-            # otherwise let this bridge into unrelated lines.
+            # (?!\s*[*/]) excludes comment lines -- kernel doc convention
+            # writes "* funcname() - description" which would otherwise
+            # false-match. [\w \t\*]  (not \s) keeps the flexible middle
+            # portion from crossing newlines, since \s matches '\n' too
+            # and would otherwise let this bridge into unrelated lines.
             pattern = re.compile(
                 r"^(?![ \t])(?!\*)(?!/)(?:static[ \t]+)?(?:inline[ \t]+)?"
                 r"[\w \t\*]*?\b" + re.escape(name) + r"[ \t]*\(", re.M)
-            match_lines = [text.count("\n", 0, m.start()) + 1
-                           for m in pattern.finditer(text)]
+            # Pattern alone can't distinguish a definition from a call or a
+            # forward declaration -- "name(" at line-start matches a call
+            # like "hdd_monitor_mode_tx_inject(adapter, dev, skb);" just as
+            # readily as the real definition. Confirm each match's parameter
+            # list is followed by '{' (a definition) before counting it.
+            match_lines = []
+            for m in pattern.finditer(text):
+                open_paren_idx = m.end() - 1  # pattern consumes the '(' itself
+                if (text[open_paren_idx] == "("
+                        and _is_function_definition(text, open_paren_idx)):
+                    match_lines.append(text.count("\n", 0, m.start()) + 1)
             if len(match_lines) <= 1:
                 print(f"  ok  {name}  ({rel}) -- {len(match_lines)} occurrence(s)")
                 continue
@@ -366,6 +551,7 @@ def scan_for_duplicate_functions():
                        f"likely a real compile-breaking duplicate")
                 FAILURES.append(msg)
                 print(f"  !! {msg}")
+                _diagnose_duplicate(target, name, match_lines)
     if not any_found:
         print("\n  No unresolved duplicates found.")
 
@@ -587,6 +773,63 @@ def apply_hand_merges():
         "\treturn 0;\n}",
         "main.c __hdd_mon_open")
 
+    # --- wma.h : legacy WMA_LOGE/W/D/I macro compatibility shim. The
+    #     patch was authored against an older baseline where this family
+    #     was still the logging convention in core/wma/src/*.c -- confirmed
+    #     by context lines in the patch itself (e.g. the unchanged
+    #     "WMA_LOGE(...)" line around the Tx-complete-callback check) that
+    #     no longer match this tree's actual content there at all (this
+    #     tree already reads wma_err()/wma_warn()/etc. at those spots,
+    #     confirmed via live grep -- the module-wide rename predates this
+    #     patch and is unrelated to it). WMA_LOGE itself is not defined
+    #     ANYWHERE in this tree (confirmed via a repo-wide grep turning up
+    #     zero #define sites), so every "+" line the patch adds using it
+    #     is an implicit-function-declaration compile error, confirmed via
+    #     live CI across all three files that carry it: the new
+    #     wma_frame_inject.c (7 call sites, confirmed to #include "wma.h"
+    #     as its first header), plus one hand-merged call each in
+    #     wma_main.c (this fix, below) and wma_mgmt.c (landed via the bulk
+    #     patch step, no hand-merge needed). Fixing each call site
+    #     individually can't be fully verified in one CI round-trip since
+    #     parallel make aborts after the first failures, so a build might
+    #     not even reach every file that has the problem yet -- one
+    #     compatibility shim in wma.h, right next to the real wma_err/
+    #     wma_warn/wma_debug/wma_info definitions it maps onto, reaches
+    #     every file that already #include "wma.h" (which every WMA-layer
+    #     source file in this patch does) regardless of how far the build
+    #     gets. WMA_LOGW/D/I are included too even though only WMA_LOGE is
+    #     confirmed to land in compiled code -- the mapping itself is
+    #     fully grounded (wma.h's own real macros, same params... call
+    #     convention), so including the other three is a zero-risk hedge,
+    #     not a guess. ---
+    f = WMA_INC / "wma.h"
+    wma_log_macros = (
+        "#define wma_alert(params...) QDF_TRACE_FATAL(QDF_MODULE_ID_WMA, params)\n"
+        "#define wma_err(params...) QDF_TRACE_ERROR(QDF_MODULE_ID_WMA, params)\n"
+        "#define wma_warn(params...) QDF_TRACE_WARN(QDF_MODULE_ID_WMA, params)\n"
+        "#define wma_info(params...) QDF_TRACE_INFO(QDF_MODULE_ID_WMA, params)\n"
+        "#define wma_debug(params...) QDF_TRACE_DEBUG(QDF_MODULE_ID_WMA, params)\n"
+        "#define wma_debug_rl(params...) QDF_TRACE_DEBUG_RL(QDF_MODULE_ID_WMA, params)\n"
+        "#define wma_err_rl(params...) QDF_TRACE_ERROR_RL(QDF_MODULE_ID_WMA, params)\n"
+    )
+    wma_legacy_shim = (
+        "#ifdef FEATURE_FRAME_INJECTION_SUPPORT\n"
+        "/* 07_packet_injection.patch was authored against a baseline that\n"
+        " * still used the legacy WMA_LOG* macro family; this tree has since\n"
+        " * moved to wma_err()/wma_warn()/etc. and no longer defines them. */\n"
+        "#define WMA_LOGE(params...) wma_err(params)\n"
+        "#define WMA_LOGW(params...) wma_warn(params)\n"
+        "#define WMA_LOGD(params...) wma_debug(params)\n"
+        "#define WMA_LOGI(params...) wma_info(params)\n"
+        "#endif\n"
+    )
+    if already_present(f, "#define WMA_LOGE(params...) wma_err(params)"):
+        print("[wma.h legacy log macro shim] already present -- skipping")
+    else:
+        fuzzy_replace(f, wma_log_macros, wma_log_macros + wma_legacy_shim,
+                      "wma.h legacy WMA_LOGE/W/D/I shim",
+                      diagnose_needle="#define wma_err_rl(params...)")
+
     # --- wma_main.c : wma_open -- inject queue init, after this tree's
     #     extra wma_trace_init() call ---
     f = WMA_SRC / "wma_main.c"
@@ -604,8 +847,83 @@ def apply_hand_merges():
         "\t}\n\n\treturn QDF_STATUS_SUCCESS;",
         "wma_main.c wma_open injection queue init")
 
-    # --- wma_utils.c : wma_mon_mlme_vdev_down_send -- del_bss_resp alloc ---
+    # --- wma_utils.c : wma_mon_mlme_vdev_down_send -- del_bss_resp alloc.
+    #     The patch's hunk for this function is actually TWO separate
+    #     hunks: one adding "struct del_bss_resp *resp;" at the top of the
+    #     function (@@ -4690,6 +4690,7 @@, a 1-line addition), and one
+    #     adding the resp=alloc/use block near the end (@@ -4703,10
+    #     +4704,15 @@). Only the second one had hand-merge logic in this
+    #     script -- the first was silently dropped as an unaddressed .rej
+    #     (the file was already in ATTEMPTED_FILES because of the second
+    #     hunk's fix, so check_unaddressed_rejects() never flagged it).
+    #     Confirmed via live CI: 'use of undeclared identifier resp' at
+    #     every use site below. struct del_bss_resp is a real, unrenamed
+    #     type (wlan_mlme_main.h, fields status/vdev_id -- matches what the
+    #     usage code assumes) and both wma_internal.h and wlan_mlme_main.h
+    #     are already included in this file, so only the local declaration
+    #     itself is missing.
+    #     Anchored on the function's own signature (unique -- the name
+    #     appears once) rather than the declaration list's text alone,
+    #     since wma_mon_mlme_vdev_stop_send() right above it has an
+    #     identical-looking 3-line declaration block that would otherwise
+    #     make the anchor ambiguous. Inserted as the LAST declaration,
+    #     before the function's first statement -- not right before its
+    #     point of use -- to avoid the exact -Wdeclaration-after-statement
+    #     class of bug already hit and fixed once this run in
+    #     __hdd_hard_start_xmit. ---
+    #     UPDATE (confirmed via a second live CI round): the bulk patch
+    #     step's --fuzz=2 actually DID apply this declaration hunk on a
+    #     later run -- just into the wrong function. wma_wlm_stats_req(),
+    #     an unrelated function with its own "QDF_STATUS status;" as its
+    #     second-to-last declaration, matched the hunk's thin surviving
+    #     context well enough under heavy fuzz, so "struct del_bss_resp
+    #     *resp;" landed there instead -- as a dead, never-referenced
+    #     local, confirmed via live CI dump. The v8 idempotency check
+    #     (already_present(f, "struct del_bss_resp *resp;"), a bare
+    #     file-wide substring search with no location awareness) saw that
+    #     text existed SOMEWHERE in the file and concluded the fix was
+    #     already done, silently skipping the real insertion into
+    #     wma_mon_mlme_vdev_down_send entirely -- exactly the kind of gap
+    #     check_unaddressed_rejects() was just hardened against, except
+    #     this one lives in an idempotency check instead. Fixed by scoping
+    #     both checks to the actual function bodies: clean up the
+    #     misplaced declaration in wma_wlm_stats_req (also sidesteps a
+    #     likely -Wunused-variable/-Werror once it's unused there), and
+    #     check for the REAL fix's presence using the full anchor-plus-
+    #     declaration text, not the declaration text alone. ---
     f = WMA_SRC / "wma_utils.c"
+    down_send_decl_anchor = (
+        "QDF_STATUS wma_mon_mlme_vdev_down_send(struct vdev_mlme_obj *vdev_mlme,\n"
+        "\t\t\t\t       uint16_t data_len, void *data)\n"
+        "{\n"
+        "\tuint8_t vdev_id;\n"
+        "\ttp_wma_handle wma = cds_get_context(QDF_MODULE_ID_WMA);\n"
+        "\tQDF_STATUS status;\n"
+    )
+    down_send_decl_fixed = down_send_decl_anchor + "\tstruct del_bss_resp *resp;\n"
+    wlm_stats_misplaced_anchor = (
+        "\twmi_request_wlm_stats_cmd_fixed_param *cmd;\n"
+        "\tQDF_STATUS status;\n"
+        "\tstruct del_bss_resp *resp;\n"
+    )
+    wlm_stats_fixed = (
+        "\twmi_request_wlm_stats_cmd_fixed_param *cmd;\n"
+        "\tQDF_STATUS status;\n"
+    )
+
+    if already_present(f, down_send_decl_fixed):
+        print("[wma_utils.c del_bss_resp declaration] already present in "
+              "wma_mon_mlme_vdev_down_send -- skipping")
+    else:
+        if already_present(f, wlm_stats_misplaced_anchor):
+            fuzzy_replace(
+                f, wlm_stats_misplaced_anchor, wlm_stats_fixed,
+                "wma_utils.c remove misplaced del_bss_resp from wma_wlm_stats_req")
+        fuzzy_replace(
+            f, down_send_decl_anchor, down_send_decl_fixed,
+            "wma_utils.c del_bss_resp declaration",
+            diagnose_needle="QDF_STATUS wma_mon_mlme_vdev_down_send(")
+
     fuzzy_replace(f,
         "\twlan_vdev_mlme_sm_deliver_evt(vdev_mlme->vdev,\n"
         "\t\t\t\t      WLAN_VDEV_SM_EV_DOWN_COMPLETE,\n"
@@ -685,80 +1003,24 @@ def apply_hand_merges():
     #     not generic CAF prose) rather than line numbers, since those drift.
     #     .get_channel isn't on frame-injection's critical path (pure
     #     userspace channel introspection), so deleting it outright is safe
-    #     -- no need to port its mon_chan_freq fallback into the real fn. ---
+    #     -- no need to port its mon_chan_freq fallback into the real fn.
+    #
+    #     NOTE: after three rounds of a hand-transcribed full-body anchor
+    #     re-breaking on each newly-discovered internal divergence (first
+    #     the missing "Primary source"/"Fallback" comments, then another
+    #     mismatch further into the body that a 70-line diagnose window
+    #     couldn't even show), the literal-body approach was abandoned.
+    #     _delete_function_by_doc_marker() below finds this function
+    #     structurally -- by its doc comment, then brace-matching to the
+    #     closing '}' -- so it's correct no matter what the body contains. ---
     f = HDD_SRC / "wlan_hdd_cfg80211.c"
     patch_get_channel_marker = "so that tools like aireplay-ng / mdk3 can determine the current channel."
     if not already_present(f, patch_get_channel_marker):
         print("[cfg80211.c get_channel dedup] patch's duplicate not present -- skipping")
     else:
-        fuzzy_replace(f,
-            "/**\n"
-            " * wlan_hdd_cfg80211_get_channel() - Report current operating channel\n"
-            " * @wiphy: wiphy handle\n"
-            " * @wdev: wireless_dev handle\n"
-            " * @chandef: output channel definition\n"
-            " *\n"
-            " * Required by nl80211 (NL80211_CMD_GET_INTERFACE) and wext (SIOCGIWFREQ)\n"
-            " * so that tools like aireplay-ng / mdk3 can determine the current channel.\n"
-            " *\n"
-            " * Return: 0 on success, -ENODATA if no channel is set.\n"
-            " */\n"
-            "static int wlan_hdd_cfg80211_get_channel(struct wiphy *wiphy,\n"
-            "\t\t\t\t\t struct wireless_dev *wdev,\n"
-            "\t\t\t\t\t struct cfg80211_chan_def *chandef)\n"
-            "{\n"
-            "\tstruct hdd_adapter *adapter = WLAN_HDD_GET_PRIV_PTR(wdev->netdev);\n"
-            "\tstruct hdd_station_ctx *sta_ctx;\n"
-            "\tstruct hdd_mon_set_ch_info *ch_info;\n"
-            "\tstruct ieee80211_channel *chan;\n"
-            "\tuint32_t freq;\n"
-            "\n"
-            "\tif (!adapter)\n"
-            "\t\treturn -ENODATA;\n"
-            "\n"
-            "\t/* Primary source: adapter->mon_chan_freq (set by both boot-time\n"
-            "\t * monitor mode and cfg80211 set_monitor_channel).\n"
-            "\t */\n"
-            "\tfreq = adapter->mon_chan_freq;\n"
-            "\n"
-            "\t/* Fallback: station context ch_info (set by hdd_mon_select_cbmode\n"
-            "\t * in the roam callback path).\n"
-            "\t */\n"
-            "\tif (!freq) {\n"
-            "\t\tsta_ctx = WLAN_HDD_GET_STATION_CTX_PTR(adapter);\n"
-            "\t\tch_info = &sta_ctx->ch_info;\n"
-            "\t\tfreq = ch_info->freq;\n"
-            "\t}\n"
-            "\n"
-            "\tif (!freq)\n"
-            "\t\treturn -ENODATA;\n"
-            "\n"
-            "\tchan = ieee80211_get_channel(wiphy, freq);\n"
-            "\tif (!chan)\n"
-            "\t\treturn -ENODATA;\n"
-            "\n"
-            "\tcfg80211_chandef_create(chandef, chan, NL80211_CHAN_NO_HT);\n"
-            "\n"
-            "\tswitch (adapter->mon_bandwidth) {\n"
-            "\tcase CH_WIDTH_40MHZ:\n"
-            "\t\tchandef->width = NL80211_CHAN_WIDTH_40;\n"
-            "\t\tbreak;\n"
-            "\tcase CH_WIDTH_80MHZ:\n"
-            "\t\tchandef->width = NL80211_CHAN_WIDTH_80;\n"
-            "\t\tbreak;\n"
-            "\tcase CH_WIDTH_160MHZ:\n"
-            "\t\tchandef->width = NL80211_CHAN_WIDTH_160;\n"
-            "\t\tbreak;\n"
-            "\tdefault:\n"
-            "\t\tbreak;\n"
-            "\t}\n"
-            "\n"
-            "\treturn 0;\n"
-            "}\n"
-            "\n",
-            "",
-            "cfg80211.c remove duplicate get_channel",
-            diagnose_needle=patch_get_channel_marker)
+        _delete_function_by_doc_marker(
+            f, patch_get_channel_marker,
+            "cfg80211.c remove duplicate get_channel")
 
         # Drop one of the two identical .get_channel = ... designated
         # initializers in wlan_hdd_cfg80211_ops (disambiguate via the
@@ -783,6 +1045,252 @@ def apply_hand_merges():
         "CONFIG_FEATURE_MONITOR_MODE_SUPPORT := y\n"
         "CONFIG_FEATURE_FRAME_INJECTION_SUPPORT := y\n",
         "default_defconfig injection flag")
+
+    # --- qca_vendor.h : the patch's antenna-diversity-probe hunk landed in
+    #     entirely the wrong enum. Its context was only "RX_NSS = 78," +
+    #     blank line before the insertion, and the generic "/* keep last */"
+    #     / AFTER_LAST / MAX idiom after it -- and that idiom repeats
+    #     verbatim across dozens of unrelated enums in this header. Under
+    #     --fuzz=2, patch dropped the (now-distant, since this tree's
+    #     enum qca_wlan_vendor_attr_config has grown well past RX_NSS=78
+    #     since the patch's baseline) trailing-context requirement and
+    #     spliced the six new attrs into the next "keep last" block it
+    #     found instead: enum qca_wlan_vendor_attr_acs_offload, right
+    #     after QCA_WLAN_VENDOR_ATTR_ACS_EHT_ENABLED = 19. Confirmed via
+    #     direct file dump in CI. This silently bloats acs_offload's own
+    #     MAX from 19 to 129 (harmless by itself today, nothing reads
+    #     those indices there -- but wrong, and worth not leaving in
+    #     place) while leaving qca_wlan_vendor_attr_config's own MAX at
+    #     81, which is what wlan_hdd_cfg80211.c's designated initializers
+    #     for these same six attrs then fail to fit inside.
+    #     Fix: cut the six-entry block out of acs_offload's tail and
+    #     splice it into config's own tail instead, right after its real
+    #     last member (QCA_WLAN_VENDOR_ATTR_CONFIG_ARP_NS_OFFLOAD = 81)
+    #     and before ITS "/* keep last */". Each entry keeps its explicit
+    #     value (124-129), so only the two AFTER_LAST/MAX pairs move:
+    #     config's 82/81 -> 130/129 (matching every nla_parse() site that
+    #     already reads _CONFIG_MAX), acs_offload's back down to 20/19. ---
+    f = WLAN_DIR / "qca-wifi-host-cmn/os_if/linux/qca_vendor.h"
+    six_entries_block = (
+        "\n"
+        "\t/* 16-bit unsigned value. For probing RSSI on other antennas, this\n"
+        "\t * attribute specifies the number of WLAN probes.\n"
+        "\t */\n"
+        "\tQCA_WLAN_VENDOR_ATTR_CONFIG_ANT_DIV_PROBE_COUNT_WLAN = 124,\n"
+        "\n"
+        "\t/* 16-bit unsigned value. For probing RSSI on other antennas, this\n"
+        "\t * attribute specifies the number of BT probes.\n"
+        "\t */\n"
+        "\tQCA_WLAN_VENDOR_ATTR_CONFIG_ANT_DIV_PROBE_COUNT_BT = 125,\n"
+        "\n"
+        "\t/* 16-bit unsigned value. This attribute specifies the WLAN RSSI\n"
+        "\t * threshold. The firmware will start to probe RSSI on other antenna\n"
+        "\t * if WLAN RSSI is lower than the threshold.\n"
+        "\t */\n"
+        "\tQCA_WLAN_VENDOR_ATTR_CONFIG_ANT_DIV_PROBE_WLAN_RSSI_THRESHOLD = 126,\n"
+        "\n"
+        "\t/* 16-bit unsigned value. This attribute specifies the BT RSSI\n"
+        "\t * threshold. The firmware will start to probe RSSI on other antenna\n"
+        "\t * if BT RSSI is lower than the threshold.\n"
+        "\t */\n"
+        "\tQCA_WLAN_VENDOR_ATTR_CONFIG_ANT_DIV_PROBE_BT_RSSI_THRESHOLD = 127,\n"
+        "\n"
+        "\t/* 16-bit unsigned value. This attribute specifies the WLAN RSSI\n"
+        "\t * difference. The firmware will select a better antenna if WLAN RSSI\n"
+        "\t * difference is larger than the value.\n"
+        "\t */\n"
+        "\tQCA_WLAN_VENDOR_ATTR_CONFIG_ANT_DIV_SWITCH_WLAN_RSSI_DIFF = 128,\n"
+        "\n"
+        "\t/* 16-bit unsigned value. This attribute specifies the BT RSSI\n"
+        "\t * difference. The firmware will select a better antenna if WLAN RSSI\n"
+        "\t * difference larger than the value.\n"
+        "\t */\n"
+        "\tQCA_WLAN_VENDOR_ATTR_CONFIG_ANT_DIV_SWITCH_BT_RSSI_DIFF = 129,\n"
+        "\n"
+    )
+    short_misplaced_marker = (
+        "QCA_WLAN_VENDOR_ATTR_ACS_EHT_ENABLED = 19,\n"
+        "\n"
+        "\t/* 16-bit unsigned value. For probing RSSI on other antennas, this\n"
+        "\t * attribute specifies the number of WLAN probes.")
+    short_fixed_marker = (
+        "QCA_WLAN_VENDOR_ATTR_CONFIG_ARP_NS_OFFLOAD = 81,\n"
+        "\n"
+        "\t/* 16-bit unsigned value. For probing RSSI on other antennas, this\n"
+        "\t * attribute specifies the number of WLAN probes.")
+
+    if already_present(f, short_fixed_marker):
+        print("[qca_vendor.h ant_div relocation] already in the correct "
+              "enum (qca_wlan_vendor_attr_config) -- skipping")
+    elif not already_present(f, short_misplaced_marker):
+        msg = ("[qca_vendor.h ant_div relocation] six-entry block not found "
+               "at its known-wrong location (acs_offload's tail) and not "
+               "found at the correct location either -- tree has drifted "
+               "further than expected, needs a human to re-check")
+        FAILURES.append(msg)
+        _diagnose(f, "QCA_WLAN_VENDOR_ATTR_CONFIG_ANT_DIV_PROBE_COUNT_WLAN")
+    else:
+        removed = fuzzy_replace(
+            f,
+            "\tQCA_WLAN_VENDOR_ATTR_ACS_EHT_ENABLED = 19,\n"
+            + six_entries_block +
+            "\t/* keep last */\n"
+            "\tQCA_WLAN_VENDOR_ATTR_ACS_AFTER_LAST,\n",
+            "\tQCA_WLAN_VENDOR_ATTR_ACS_EHT_ENABLED = 19,\n"
+            "\n"
+            "\t/* keep last */\n"
+            "\tQCA_WLAN_VENDOR_ATTR_ACS_AFTER_LAST,\n",
+            "qca_vendor.h remove ant_div block from acs_offload",
+            diagnose_needle="QCA_WLAN_VENDOR_ATTR_ACS_EHT_ENABLED = 19,")
+        if removed:
+            fuzzy_replace(
+                f,
+                "\tQCA_WLAN_VENDOR_ATTR_CONFIG_ARP_NS_OFFLOAD = 81,\n"
+                "\n"
+                "\t/* keep last */\n"
+                "\tQCA_WLAN_VENDOR_ATTR_CONFIG_AFTER_LAST,\n",
+                "\tQCA_WLAN_VENDOR_ATTR_CONFIG_ARP_NS_OFFLOAD = 81,\n"
+                + six_entries_block +
+                "\t/* keep last */\n"
+                "\tQCA_WLAN_VENDOR_ATTR_CONFIG_AFTER_LAST,\n",
+                "qca_vendor.h insert ant_div block into qca_wlan_vendor_attr_config",
+                diagnose_needle="QCA_WLAN_VENDOR_ATTR_CONFIG_ARP_NS_OFFLOAD = 81,")
+
+    # --- tx_rx.c : radiotap include. The patch's own include-block hunk
+    #     (@@ -59,6 +59,9 @@, confirmed directly from the patch file) adds
+    #     the FEATURE_FRAME_INJECTION_SUPPORT guard for
+    #     wlan_hdd_frame_inject.h, but never adds an unconditional
+    #     #include <net/ieee80211_radiotap.h> anywhere. This tree already
+    #     has a conditional radiotap include further down:
+    #         #if defined(WLAN_SUPPORT_RX_FISA)
+    #         #include "dp_fisa_rx.h"
+    #         #else
+    #         #include <net/ieee80211_radiotap.h>
+    #         #endif
+    #     -- so in any build where WLAN_SUPPORT_RX_FISA is defined, that
+    #     #else branch is skipped and the injection code's use of struct
+    #     ieee80211_radiotap_header / ieee80211_get_radiotap_len() hits an
+    #     incomplete-type error (confirmed via live CI compile log). Add our
+    #     own unconditional include, guarded only by
+    #     FEATURE_FRAME_INJECTION_SUPPORT, right next to the include the
+    #     patch already added -- header guards make the (harmless) double
+    #     include under !WLAN_SUPPORT_RX_FISA builds a non-issue. ---
+    f = HDD_SRC / "wlan_hdd_tx_rx.c"
+    radiotap_include_tail = (
+        '#include "wlan_hdd_frame_inject.h"\n'
+        '#include <net/ieee80211_radiotap.h>\n#endif\n')
+    if already_present(f, radiotap_include_tail):
+        print("[tx_rx.c radiotap include] already present -- skipping")
+    else:
+        fuzzy_replace(
+            f,
+            '#ifdef FEATURE_FRAME_INJECTION_SUPPORT\n'
+            '#include "wlan_hdd_frame_inject.h"\n#endif\n',
+            '#ifdef FEATURE_FRAME_INJECTION_SUPPORT\n' + radiotap_include_tail,
+            "tx_rx.c radiotap include",
+            diagnose_needle='#include "wlan_hdd_frame_inject.h"')
+
+    # --- tx_rx.c : __hdd_hard_start_xmit -- xmit probe log + injection
+    #     check landed in the wrong function. The patch's own hunk header
+    #     (@@ -959,6 +1110,27 @@ static void __hdd_hard_start_xmit(struct
+    #     sk_buff *skb), confirmed directly from the patch file) proves this
+    #     block was authored against __hdd_hard_start_xmit, where dev, skb,
+    #     and adapter (= WLAN_HDD_GET_PRIV_PTR(dev)) are all in scope. Under
+    #     --fuzz=2 it spliced instead into hdd_register_rx_ol_cb(struct
+    #     hdd_context *hdd_ctx, bool wifi3_0_target) -- both functions
+    #     happen to have "void *soc = cds_get_context(QDF_MODULE_ID_SOC);"
+    #     as a declaration line followed by a blank line, and that's all
+    #     the surviving context needed to match under heavy fuzz once the
+    #     real distance to the patch's original anchor grew too large.
+    #     Confirmed via live CI: 'use of undeclared identifier dev/adapter/
+    #     skb' at exactly the lines this block occupies inside
+    #     hdd_register_rx_ol_cb, which only takes (hdd_ctx, wifi3_0_target)
+    #     and never has dev/adapter/skb in scope at all.
+    #     Fix: cut the block out of hdd_register_rx_ol_cb and splice it
+    #     into __hdd_hard_start_xmit -- anchored on the END of the
+    #     function's declaration list (now "int cpu =
+    #     qdf_get_smp_processor_id();", the last declaration before
+    #     "#ifdef QCA_WIFI_FTM" in the current tree), not on an arbitrary
+    #     declaration line in the middle of the list. The patch's own hunk
+    #     context confirms this -- its post-context shows "#ifdef
+    #     QCA_WIFI_FTM" as the line immediately following the inserted
+    #     block in its original baseline, where "void *soc = ...;" WAS the
+    #     last declaration. This tree has since grown that declaration list
+    #     (subtype, is_eapol, is_dhcp, stats, cpu all came later), but the
+    #     adjacency to "#ifdef QCA_WIFI_FTM" is still the real anchor.
+    #     (An earlier version of this fix anchored on "void *soc = ...;"
+    #     instead and inserted a statement block ahead of later
+    #     declarations -- compiles clean with GCC by default but fails
+    #     under this kernel's -Wdeclaration-after-statement, confirmed via
+    #     live CI: "ISO C90 forbids mixing declarations and code" pointing
+    #     at the now-downstream "enum qdf_proto_subtype subtype = ...;".
+    #     Inserting after the LAST declaration avoids this categorically,
+    #     matching the patch's actual original intent.) ---
+    xmit_probe_block = (
+        "\tstatic bool xmit_probe_logged;\n"
+        "\n"
+        "\tif (!xmit_probe_logged) {\n"
+        "\t\thdd_warn(\"xmit probe: if=%s mode=%d iftype=%d dev_type=%u flags=0x%x len=%u mon_ctx=%u\",\n"
+        "\t\t\t dev ? dev->name : \"null\",\n"
+        "\t\t\t adapter ? adapter->device_mode : -1,\n"
+        "\t\t\t (dev && dev->ieee80211_ptr) ? dev->ieee80211_ptr->iftype : -1,\n"
+        "\t\t\t dev ? dev->type : 0,\n"
+        "\t\t\t dev ? dev->flags : 0,\n"
+        "\t\t\t skb ? skb->len : 0,\n"
+        "\t\t\t (adapter && adapter->injection_ctx &&\n"
+        "\t\t\t  adapter->injection_ctx->is_monitor_mode) ? 1 : 0);\n"
+        "\t\txmit_probe_logged = true;\n"
+        "\t}\n"
+        "\n"
+        "#ifdef FEATURE_FRAME_INJECTION_SUPPORT\n"
+        "\tif (hdd_is_monitor_tx_dev(adapter, dev)) {\n"
+        "\t\thdd_monitor_mode_tx_inject(adapter, dev, skb);\n"
+        "\t\treturn;\n"
+        "\t}\n"
+        "#endif\n"
+    )
+    xmit_probe_misplaced_marker = (
+        "\tvoid *soc = cds_get_context(QDF_MODULE_ID_SOC);\n"
+        + xmit_probe_block +
+        "\n\tif  (!hdd_ctx) {\n"
+    )
+    # Anchored on the END of __hdd_hard_start_xmit's declaration list (the
+    # last declaration, "int cpu = ...;", immediately followed by "#ifdef
+    # QCA_WIFI_FTM") -- see comment above for why, after the
+    # -Wdeclaration-after-statement failure on an earlier mid-declaration
+    # anchor.
+    xmit_probe_decl_end = "\tint cpu = qdf_get_smp_processor_id();\n"
+    xmit_probe_ftm_guard = "\n#ifdef QCA_WIFI_FTM\n"
+    xmit_probe_fixed_marker = (
+        xmit_probe_decl_end + xmit_probe_block + xmit_probe_ftm_guard
+    )
+
+    if already_present(f, xmit_probe_fixed_marker):
+        print("[tx_rx.c xmit_probe relocation] already in "
+              "__hdd_hard_start_xmit -- skipping")
+    elif not already_present(f, xmit_probe_misplaced_marker):
+        msg = ("[tx_rx.c xmit_probe relocation] block not found at its "
+               "known-wrong location (hdd_register_rx_ol_cb) and not found "
+               "at the correct location either -- tree has drifted further "
+               "than expected, needs a human to re-check")
+        FAILURES.append(msg)
+        _diagnose(f, "xmit_probe_logged")
+    else:
+        removed = fuzzy_replace(
+            f,
+            xmit_probe_misplaced_marker,
+            "\tvoid *soc = cds_get_context(QDF_MODULE_ID_SOC);\n"
+            "\n\tif  (!hdd_ctx) {\n",
+            "tx_rx.c remove xmit_probe block from hdd_register_rx_ol_cb",
+            diagnose_needle="xmit_probe_logged")
+        if removed:
+            fuzzy_replace(
+                f,
+                xmit_probe_decl_end + xmit_probe_ftm_guard,
+                xmit_probe_fixed_marker,
+                "tx_rx.c insert xmit_probe block into __hdd_hard_start_xmit "
+                "(after last declaration, before first statement)",
+                diagnose_needle="int cpu = qdf_get_smp_processor_id();")
 
     # --- wma_frame_inject.c : two struct-field mismatches against this
     #     tree's actual struct wma_txrx_node (core/wma/inc/wma.h), both
@@ -849,16 +1357,61 @@ def apply_hand_merges():
 
 
 def check_unaddressed_rejects():
-    """Flag any .rej whose target file has NO hand-merge logic at all in
-    this script, so an unknown divergence doesn't get silently wiped by
-    cleanup() and mistaken for a clean run."""
+    """Flag any .rej that looks unaddressed in the final tree.
+
+    Originally this only checked whether the target FILE had any
+    hand-merge logic at all (ATTEMPTED_FILES) -- but that's too coarse: a
+    file can have working hand-merge logic for one hunk while a SEPARATE
+    hunk against the same file is silently dropped, because the file being
+    in ATTEMPTED_FILES (for the first hunk) hid the second hunk's reject
+    from ever being flagged. This happened for real: wma_utils.c had
+    correct hand-merge logic for its resp=alloc/use hunk, but a separate,
+    earlier hunk adding "struct del_bss_resp *resp;" had none -- its .rej
+    was swept away by cleanup() unflagged, and the gap only surfaced as a
+    live CI compile failure ('use of undeclared identifier resp').
+
+    So beyond the file-level check, for every remaining .rej whose target
+    file DOES have other hand-merge logic, check whether this specific
+    reject's own added ("+") lines actually made it into the final file
+    somewhere (regardless of exact position -- hand-merged text may
+    legitimately differ in whitespace/surroundings from the literal
+    reject). If most of a reject's added content is nowhere in the file,
+    it's very likely a hunk nothing has ever actually handled."""
     for rej in sorted(WLAN_DIR.rglob("*.rej")):
+        rel = str(rej.relative_to(WLAN_DIR))
+        if rel in KNOWN_INAPPLICABLE_REJECTS:
+            print(f"[known-inapplicable] {rel} -- {KNOWN_INAPPLICABLE_REJECTS[rel]}")
+            continue
         target = rej.with_suffix("").resolve()
         if target not in ATTEMPTED_FILES:
             FAILURES.append(
                 f"[unaddressed] {rej.relative_to(WLAN_DIR)} -- no hand-merge "
                 f"logic exists for this file yet, see dump_rejects() output "
                 f"above for ground truth"
+            )
+            continue
+        if not target.exists():
+            continue
+        rej_text = rej.read_text()
+        added_lines = [
+            l[1:].strip() for l in rej_text.split("\n")
+            if l.startswith("+") and not l.startswith("+++") and l[1:].strip()
+        ]
+        if not added_lines:
+            continue
+        target_text = target.read_text()
+        missing = [l for l in added_lines if l not in target_text]
+        # Slack for legitimately-reworded hand merges: only flag when a
+        # clear majority of THIS reject's added lines are nowhere in the
+        # file at all, not just absent at the reject's original position.
+        if len(missing) > len(added_lines) * 0.5:
+            FAILURES.append(
+                f"[unaddressed] {rej.relative_to(WLAN_DIR)} -- {target.name} "
+                f"has hand-merge logic for other hunks, but {len(missing)}/"
+                f"{len(added_lines)} of THIS reject's added lines are not "
+                f"present anywhere in the final file -- likely a hunk this "
+                f"script doesn't actually handle yet, see dump_rejects() "
+                f"output above for ground truth"
             )
 
 
@@ -873,47 +1426,32 @@ def cleanup():
               f"(see FAILED list below if any were never addressed)")
 
 
-def diagnose_qca_vendor_enum():
-    """Dump real, CI-fresh context around the ANT_DIV enum block and the
-    QCA_WLAN_VENDOR_ATTR_CONFIG_MAX computation in qca_vendor.h. This file's
-    hunk has behaved inconsistently across runs (sometimes fuzzy-succeeds,
-    sometimes fails outright), and a build error showed the patch's new
-    ANT_DIV_PROBE_COUNT_WLAN..SWITCH_BT_RSSI_DIFF constants resolving to
-    124-129 while the array they index only has 82 slots -- meaning MAX
-    wasn't bumped to match wherever those new members actually landed.
-    Printed from THIS run's actual tree, not a possibly-stale local one."""
-    f = WLAN_DIR / "qca-wifi-host-cmn/os_if/linux/qca_vendor.h"
-    print(f"\n{'=' * 60}\nDIAGNOSING qca_vendor.h ANT_DIV / MAX enum state\n{'=' * 60}")
-    if not f.exists():
-        print(f"  (file not found: {f})")
-        return
-    text = f.read_text()
-    for marker in (
-        "QCA_WLAN_VENDOR_ATTR_CONFIG_ANT_DIV_ACK_SNR_WEIGHT",
-        "QCA_WLAN_VENDOR_ATTR_CONFIG_ANT_DIV_PROBE_COUNT_WLAN",
-        "QCA_WLAN_VENDOR_ATTR_CONFIG_AFTER_LAST",
-        "QCA_WLAN_VENDOR_ATTR_CONFIG_MAX",
-    ):
-        idx = text.find(marker)
-        if idx == -1:
-            print(f"  '{marker}' -- NOT FOUND anywhere in file")
-            continue
-        line_no = text.count("\n", 0, idx) + 1
-        print(f"  '{marker}' found at line {line_no}")
-    print()
-    _diagnose(f, "QCA_WLAN_VENDOR_ATTR_CONFIG_ANT_DIV_ACK_SNR_WEIGHT", context_lines=50)
-    _diagnose(f, "QCA_WLAN_VENDOR_ATTR_CONFIG_AFTER_LAST", context_lines=20)
+def write_error_report():
+    """Write this run's outcome to a fixed, predictable path so CI can
+    archive it as a build artifact (via upload-artifact + if: always())
+    regardless of exit code. The terminal log is easy to lose or truncate
+    on a long build; this file isn't, and it's a stable target to wire an
+    upload step to without having to touch this script again later."""
+    report_path = REPO_ROOT / "injection_patch_report.log"
+    lines = []
+    if FAILURES:
+        lines.append(f"FAILED: {len(FAILURES)} hand-merge fix(es) did not apply:")
+        lines.extend(f"  - {msg}" for msg in FAILURES)
+    else:
+        lines.append("All hunks applied or hand-merged successfully.")
+    report_path.write_text("\n".join(lines) + "\n")
+    print(f"\n[error report] wrote {report_path.relative_to(REPO_ROOT)}")
 
 
 def main():
     print(f"apply_injection_patch.py {SCRIPT_VERSION}")
     run_bulk_patch()
     dump_rejects()
-    diagnose_qca_vendor_enum()
     apply_hand_merges()
     check_unaddressed_rejects()
     scan_for_duplicate_functions()
     cleanup()
+    write_error_report()
 
     print("\n" + "=" * 60)
     if FAILURES:

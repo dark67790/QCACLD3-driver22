@@ -36,6 +36,14 @@ import subprocess
 import sys
 from pathlib import Path
 
+# Bumped on every change shipped. Printed as the very first line of output
+# so a CI log makes it immediately, unambiguously obvious whether the repo
+# actually has the version being discussed -- "anchor not found" vs
+# "doc marker not present" are different code paths from different script
+# versions, and that mismatch is exactly what happened here: hard to tell
+# apart by error message alone, trivial to tell apart by this.
+SCRIPT_VERSION = "v11-wma_frame_inject-field-fixes"
+
 REPO_ROOT = Path.cwd()
 WLAN_DIR = REPO_ROOT / "vendor/qcom/opensource/wlan"
 QCACLD = WLAN_DIR / "qcacld-3.0"
@@ -898,6 +906,7 @@ def diagnose_qca_vendor_enum():
 
 
 def main():
+    print(f"apply_injection_patch.py {SCRIPT_VERSION}")
     run_bulk_patch()
     dump_rejects()
     diagnose_qca_vendor_enum()

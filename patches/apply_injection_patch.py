@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 """
 apply_injection_patch.py
@@ -929,6 +930,64 @@ def apply_hand_merges():
         "\t\t\t\t\t      resp);\n"
         "\t}\n\n\treturn status;",
         "wma_utils.c del_bss_resp alloc")
+
+    # --- wma_frame_inject.c : struct wma_txrx_node field-name mismatches.
+    #     wma_frame_inject.c is a brand-new file added entirely by the
+    #     patch (nothing pre-existing to preserve), so these are plain
+    #     text substitutions rather than context-anchored hand-merges --
+    #     but the replacement names are still ground-truth-confirmed via
+    #     two live-CI diagnostic rounds, not guessed:
+    #
+    #     1) iface->roaming_in_progress -- struct wma_txrx_node has NO
+    #        per-vdev "roaming in progress" boolean field in this tree at
+    #        all. Confirmed via full struct dump: the only similarly-named
+    #        fields are plm_in_progress (FEATURE_WLAN_ESE -- an unrelated
+    #        PLM feature) and extscan_in_progress (FEATURE_WLAN_EXTSCAN --
+    #        also unrelated). Clang's "did you mean plm_in_progress?" is a
+    #        spelling-similarity guess, not a semantic match, and was NOT
+    #        used. Roam-in-progress tracking in this tree is instead a
+    #        function call: wma.h declares
+    #        "bool wma_is_roam_in_progress(uint32_t vdev_id);" (defined in
+    #        wma_data.c), and it is already used for this exact
+    #        defer-because-roaming pattern elsewhere in this same codebase
+    #        at wma_mgmt.c:364 ("Ignore STA kick out since roaming is in
+    #        progress"). vdev_id is already in scope at the
+    #        wma_frame_inject.c call site and wma.h is already included
+    #        (confirmed earlier), so this is a direct drop-in swap.
+    #
+    #     2) wma_handle->interfaces[vdev_id].mhz -- struct wma_txrx_node
+    #        has no "mhz" field, but does have "uint32_t ch_freq;" on the
+    #        exact same struct, documented as "@ch_freq: channel
+    #        frequency" -- same per-vdev scope, same integer type, same
+    #        semantic (channel frequency used to set tx_chanfreq). ---
+    f = WMA_SRC / "wma_frame_inject.c"
+
+    roam_check_old = "\tif (iface->roaming_in_progress) {\n"
+    roam_check_new = "\tif (wma_is_roam_in_progress(vdev_id)) {\n"
+    if already_present(f, roam_check_new):
+        print("[wma_frame_inject.c roaming_in_progress fix] already present "
+              "-- skipping")
+    else:
+        fuzzy_replace(
+            f, roam_check_old, roam_check_new,
+            "wma_frame_inject.c roaming_in_progress -> "
+            "wma_is_roam_in_progress(vdev_id)",
+            diagnose_needle="if (iface->roaming_in_progress")
+
+    mhz_old = (
+        "\tif (wma_handle->interfaces[vdev_id].mhz)\n"
+        "\t\ttx_chanfreq = wma_handle->interfaces[vdev_id].mhz;\n"
+    )
+    mhz_new = (
+        "\tif (wma_handle->interfaces[vdev_id].ch_freq)\n"
+        "\t\ttx_chanfreq = wma_handle->interfaces[vdev_id].ch_freq;\n"
+    )
+    if already_present(f, mhz_new):
+        print("[wma_frame_inject.c mhz fix] already present -- skipping")
+    else:
+        fuzzy_replace(f, mhz_old, mhz_new,
+                      "wma_frame_inject.c .mhz -> .ch_freq",
+                      diagnose_needle="interfaces[vdev_id].mhz")
 
     # --- Kbuild : wire the new object files + cppflag into the build.
     #     Three separate insertion points, confirmed against real file

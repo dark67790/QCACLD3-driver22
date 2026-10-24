@@ -87,6 +87,24 @@ jobs:
           path: injection_patch_report.log
           if-no-files-found: ignore
 
+      - name: DEBUG dump del_bss_resp state
+        run: |
+          set +e
+          F=vendor/qcom/opensource/wlan/qcacld-3.0/core/wma/src/wma_utils.c
+
+          echo "=== count of 'struct del_bss_resp *resp;' in wma_utils.c ==="
+          grep -c "struct del_bss_resp \*resp;" "$F"
+
+          echo "=== all locations ==="
+          grep -n "struct del_bss_resp \*resp;" "$F"
+
+          echo "=== wma_mon_mlme_vdev_down_send current state ==="
+          LINE=$(grep -n "wma_mon_mlme_vdev_down_send" "$F" | head -1 | cut -d: -f1)
+          echo "found at line ${LINE:-NONE}"
+          if [ -n "$LINE" ]; then sed -n "${LINE},$((LINE+35))p" "$F"; fi
+
+          exit 0
+
       - name: Prepare kernel headers for external module
         working-directory: kernel_platform
         run: |

@@ -708,6 +708,93 @@ def apply_hand_merges():
         "#endif\n",
         "cfg80211.c vendor cmd array")
 
+    # --- wlan_hdd_frame_inject.h : FEATURE_FRAME_INJECTION_VENDOR_COMMANDS
+    #     macro is missing .policy on all three vendor command entries it
+    #     defines. Confirmed via live CI, two rounds: the module loads and
+    #     resolves all symbols fine now, but wiphy_register() itself fails
+    #     with errno -22, hitting a WARN_ON at the exact kernel source line
+    #     the user pasted from their own tree (net/wireless/core.c):
+    #         if (WARN_ON(!rdev->wiphy.vendor_commands[i].policy))
+    #                 return -EINVAL;
+    #     In C a designated initializer with no ".policy = ..." line leaves
+    #     it implicitly NULL, so all three entries this macro defines trip
+    #     that check and wiphy_register() -- and therefore the ENTIRE
+    #     wlan0 interface -- never comes up. This is a bug in the patch's
+    #     own macro definition, not something introduced by hand-merging.
+    #     The kernel's own comment just above that check names the fix:
+    #     "can be explicitly set to VENDOR_CMD_RAW_DATA which is non-NULL"
+    #     -- the standard cfg80211 sentinel for "this command parses its
+    #     own raw netlink data, skip automatic policy validation", which
+    #     matches these three handlers (none of them define an nla_policy
+    #     array anywhere in the patch). Confirmed real file whitespace via
+    #     `cat -A` on the actual built file before anchoring (tabs for
+    #     indentation, two tabs + one space on the wrapped flag-continuation
+    #     lines) -- not re-typed from the raw patch diff text, after the
+    #     stray-tab anchor miss earlier this session taught that lesson. ---
+    f = HDD_INC / "wlan_hdd_frame_inject.h"
+
+    vendor_cmds_old = (
+        "#define FEATURE_FRAME_INJECTION_VENDOR_COMMANDS \\\n"
+        "{ \\\n"
+        "\t.info.vendor_id = QCA_NL80211_VENDOR_ID, \\\n"
+        "\t.info.subcmd = QCA_NL80211_VENDOR_SUBCMD_FRAME_INJECT, \\\n"
+        "\t.flags = WIPHY_VENDOR_CMD_NEED_WDEV | \\\n"
+        "\t\t WIPHY_VENDOR_CMD_NEED_NETDEV | \\\n"
+        "\t\t WIPHY_VENDOR_CMD_NEED_RUNNING, \\\n"
+        "\t.doit = hdd_frame_inject_netlink \\\n"
+        "}, \\\n"
+        "{ \\\n"
+        "\t.info.vendor_id = QCA_NL80211_VENDOR_ID, \\\n"
+        "\t.info.subcmd = QCA_NL80211_VENDOR_SUBCMD_FRAME_INJECT_STATS, \\\n"
+        "\t.flags = WIPHY_VENDOR_CMD_NEED_WDEV | \\\n"
+        "\t\t WIPHY_VENDOR_CMD_NEED_NETDEV, \\\n"
+        "\t.doit = hdd_get_injection_stats_netlink \\\n"
+        "}, \\\n"
+        "{ \\\n"
+        "\t.info.vendor_id = QCA_NL80211_VENDOR_ID, \\\n"
+        "\t.info.subcmd = QCA_NL80211_VENDOR_SUBCMD_FRAME_INJECT_RESET, \\\n"
+        "\t.flags = WIPHY_VENDOR_CMD_NEED_WDEV | \\\n"
+        "\t\t WIPHY_VENDOR_CMD_NEED_NETDEV, \\\n"
+        "\t.doit = hdd_reset_injection_stats_netlink \\\n"
+        "}\n"
+    )
+    vendor_cmds_new = (
+        "#define FEATURE_FRAME_INJECTION_VENDOR_COMMANDS \\\n"
+        "{ \\\n"
+        "\t.info.vendor_id = QCA_NL80211_VENDOR_ID, \\\n"
+        "\t.info.subcmd = QCA_NL80211_VENDOR_SUBCMD_FRAME_INJECT, \\\n"
+        "\t.flags = WIPHY_VENDOR_CMD_NEED_WDEV | \\\n"
+        "\t\t WIPHY_VENDOR_CMD_NEED_NETDEV | \\\n"
+        "\t\t WIPHY_VENDOR_CMD_NEED_RUNNING, \\\n"
+        "\t.policy = VENDOR_CMD_RAW_DATA, \\\n"
+        "\t.doit = hdd_frame_inject_netlink \\\n"
+        "}, \\\n"
+        "{ \\\n"
+        "\t.info.vendor_id = QCA_NL80211_VENDOR_ID, \\\n"
+        "\t.info.subcmd = QCA_NL80211_VENDOR_SUBCMD_FRAME_INJECT_STATS, \\\n"
+        "\t.flags = WIPHY_VENDOR_CMD_NEED_WDEV | \\\n"
+        "\t\t WIPHY_VENDOR_CMD_NEED_NETDEV, \\\n"
+        "\t.policy = VENDOR_CMD_RAW_DATA, \\\n"
+        "\t.doit = hdd_get_injection_stats_netlink \\\n"
+        "}, \\\n"
+        "{ \\\n"
+        "\t.info.vendor_id = QCA_NL80211_VENDOR_ID, \\\n"
+        "\t.info.subcmd = QCA_NL80211_VENDOR_SUBCMD_FRAME_INJECT_RESET, \\\n"
+        "\t.flags = WIPHY_VENDOR_CMD_NEED_WDEV | \\\n"
+        "\t\t WIPHY_VENDOR_CMD_NEED_NETDEV, \\\n"
+        "\t.policy = VENDOR_CMD_RAW_DATA, \\\n"
+        "\t.doit = hdd_reset_injection_stats_netlink \\\n"
+        "}\n"
+    )
+    if already_present(f, "\t.policy = VENDOR_CMD_RAW_DATA, \\\n\t.doit = hdd_frame_inject_netlink"):
+        print("[wlan_hdd_frame_inject.h vendor cmd .policy] already present "
+              "-- skipping")
+    else:
+        fuzzy_replace(
+            f, vendor_cmds_old, vendor_cmds_new,
+            "wlan_hdd_frame_inject.h add missing .policy to vendor commands",
+            diagnose_needle="define FEATURE_FRAME_INJECTION_VENDOR_COMMANDS")
+
     # --- main.h : injection_ctx field (often already landed via the bulk
     #     patch step even when the hand-merge anchor below doesn't match
     #     due to tree-specific fields between the two anchor lines) ---

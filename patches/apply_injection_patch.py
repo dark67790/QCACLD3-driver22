@@ -861,6 +861,26 @@ def apply_hand_merges():
     #     point of use -- to avoid the exact -Wdeclaration-after-statement
     #     class of bug already hit and fixed once this run in
     #     __hdd_hard_start_xmit. ---
+    #     UPDATE (confirmed via a second live CI round): the bulk patch
+    #     step's --fuzz=2 actually DID apply this declaration hunk on a
+    #     later run -- just into the wrong function. wma_wlm_stats_req(),
+    #     an unrelated function with its own "QDF_STATUS status;" as its
+    #     second-to-last declaration, matched the hunk's thin surviving
+    #     context well enough under heavy fuzz, so "struct del_bss_resp
+    #     *resp;" landed there instead -- as a dead, never-referenced
+    #     local, confirmed via live CI dump. The v8 idempotency check
+    #     (already_present(f, "struct del_bss_resp *resp;"), a bare
+    #     file-wide substring search with no location awareness) saw that
+    #     text existed SOMEWHERE in the file and concluded the fix was
+    #     already done, silently skipping the real insertion into
+    #     wma_mon_mlme_vdev_down_send entirely -- exactly the kind of gap
+    #     check_unaddressed_rejects() was just hardened against, except
+    #     this one lives in an idempotency check instead. Fixed by scoping
+    #     both checks to the actual function bodies: clean up the
+    #     misplaced declaration in wma_wlm_stats_req (also sidesteps a
+    #     likely -Wunused-variable/-Werror once it's unused there), and
+    #     check for the REAL fix's presence using the full anchor-plus-
+    #     declaration text, not the declaration text alone. ---
     f = WMA_SRC / "wma_utils.c"
     down_send_decl_anchor = (
         "QDF_STATUS wma_mon_mlme_vdev_down_send(struct vdev_mlme_obj *vdev_mlme,\n"
@@ -870,12 +890,27 @@ def apply_hand_merges():
         "\ttp_wma_handle wma = cds_get_context(QDF_MODULE_ID_WMA);\n"
         "\tQDF_STATUS status;\n"
     )
-    if already_present(f, "struct del_bss_resp *resp;"):
-        print("[wma_utils.c del_bss_resp declaration] already present -- skipping")
+    down_send_decl_fixed = down_send_decl_anchor + "\tstruct del_bss_resp *resp;\n"
+    wlm_stats_misplaced_anchor = (
+        "\twmi_request_wlm_stats_cmd_fixed_param *cmd;\n"
+        "\tQDF_STATUS status;\n"
+        "\tstruct del_bss_resp *resp;\n"
+    )
+    wlm_stats_fixed = (
+        "\twmi_request_wlm_stats_cmd_fixed_param *cmd;\n"
+        "\tQDF_STATUS status;\n"
+    )
+
+    if already_present(f, down_send_decl_fixed):
+        print("[wma_utils.c del_bss_resp declaration] already present in "
+              "wma_mon_mlme_vdev_down_send -- skipping")
     else:
+        if already_present(f, wlm_stats_misplaced_anchor):
+            fuzzy_replace(
+                f, wlm_stats_misplaced_anchor, wlm_stats_fixed,
+                "wma_utils.c remove misplaced del_bss_resp from wma_wlm_stats_req")
         fuzzy_replace(
-            f, down_send_decl_anchor,
-            down_send_decl_anchor + "\tstruct del_bss_resp *resp;\n",
+            f, down_send_decl_anchor, down_send_decl_fixed,
             "wma_utils.c del_bss_resp declaration",
             diagnose_needle="QDF_STATUS wma_mon_mlme_vdev_down_send(")
 

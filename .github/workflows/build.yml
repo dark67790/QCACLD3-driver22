@@ -90,23 +90,26 @@ jobs:
 
       - name: DEBUG dump remaining cfg80211.c hunks
         run: |
+          set +e
           F=vendor/qcom/opensource/wlan/qcacld-3.0/core/hdd/src/wlan_hdd_cfg80211.c
 
-          echo "=== 1: sme_roam_connect call site (wlan_hdd_cfg80211_connect_start) ==="
-          grep -n -B 15 -A 5 "qdf_status = sme_roam_connect(" "$F"
+          echo "=== 1: sme_roam_connect call site ==="
+          grep -n -B 15 -A 5 "sme_roam_connect(" "$F"
 
-          echo "=== 2: chandef.width call site (__wlan_hdd_cfg80211_join_ibss) ==="
-          grep -n -B 20 -A 5 "params->chandef.width);" "$F"
+          echo "=== 2: chandef.width call site ==="
+          grep -n -B 20 -A 5 "chandef.width" "$F"
 
-          echo "=== 3: hdd_dump_connect_req full function ==="
-          LINE=$(grep -n "^static inline void hdd_dump_connect_req" "$F" | head -1 | cut -d: -f1)
-          echo "found at line $LINE"
-          sed -n "${LINE},$((LINE+60))p" "$F"
+          echo "=== 3: hdd_dump_connect_req function ==="
+          LINE=$(grep -n "hdd_dump_connect_req" "$F" | head -1 | cut -d: -f1)
+          echo "found at line ${LINE:-NONE}"
+          if [ -n "$LINE" ]; then sed -n "${LINE},$((LINE+60))p" "$F"; fi
 
           echo "=== 4: __wlan_hdd_cfg80211_connect span ==="
-          LINE2=$(grep -n "^static int __wlan_hdd_cfg80211_connect(struct wiphy \*wiphy," "$F" | head -1 | cut -d: -f1)
-          echo "found at line $LINE2"
-          sed -n "${LINE2},$((LINE2+120))p" "$F"
+          LINE2=$(grep -n "__wlan_hdd_cfg80211_connect(struct wiphy" "$F" | head -1 | cut -d: -f1)
+          echo "found at line ${LINE2:-NONE}"
+          if [ -n "$LINE2" ]; then sed -n "${LINE2},$((LINE2+120))p" "$F"; fi
+
+          exit 0
 
       - name: DEBUG dump ant_div policy array context
         run: |

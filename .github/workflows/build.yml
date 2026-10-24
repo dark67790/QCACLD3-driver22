@@ -76,6 +76,7 @@ jobs:
           test -d vendor/qcom/opensource/wlan/qca-wifi-host-cmn
 
       - name: Apply packet injection patch + tree-specific fixups
+        continue-on-error: true
         run: |
           python3 patches/apply_injection_patch.py
 

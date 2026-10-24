@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 """
 apply_injection_patch.py
@@ -988,6 +987,80 @@ def apply_hand_merges():
         fuzzy_replace(f, mhz_old, mhz_new,
                       "wma_frame_inject.c .mhz -> .ch_freq",
                       diagnose_needle="interfaces[vdev_id].mhz")
+
+    # --- wlan_hdd_inject_security.c : hdd_check_injection_capability()
+    #     fetches a task's cred via get_task_cred()/put_cred() but NEVER
+    #     actually reads it -- the real decision is "has_capability =
+    #     capable(CAP_NET_RAW);", which always checks current's own
+    #     capabilities regardless of the cred fetched (capable() doesn't
+    #     take a cred argument at all). Confirmed via live CI on the real
+    #     device: on this Samsung KDP-hardened kernel, get_task_cred() /
+    #     put_cred() pull in kdp_usecount_dec_and_test (KDP's wrapped
+    #     credential refcounting) as a transitive symbol, and whatever
+    #     Module.symvers this build has access to doesn't carry a matching
+    #     CRC for it, so insmod rejects the whole module with "Unknown
+    #     symbol" for get_task_cred / __put_cred / kdp_usecount_dec_and_test
+    #     together. Confirmed via nm -u diff against the last known-good
+    #     (pre-patch) build that none of those three symbols were ever
+    #     referenced before this patch.
+    #
+    #     This is a safe removal, not a security-check weakening: the cred
+    #     fetch's only other effect is a NULL check that's realistically
+    #     unreachable (a live task_struct always has a valid cred), and
+    #     the one real call site (hdd_check_injection_capability(NULL),
+    #     confirmed via grep -- the only call site in the whole patch)
+    #     always passes NULL, meaning task is always `current` in
+    #     practice -- the exact same task capable() already checks.
+    #     Removing the dead fetch/release leaves capable(CAP_NET_RAW)
+    #     completely intact as the actual gate. ---
+    f = HDD_SRC / "wlan_hdd_inject_security.c"
+
+    inject_cap_old = (
+        "\tconst struct cred *cred;\n"
+        "\tbool has_capability = false;\n"
+        "\n"
+        "\thdd_security_debug(\"Checking injection capabilities\");\n"
+        "\n"
+        "\t/* Use current task if none specified */\n"
+        "\tif (!task)\n"
+        "\t\ttask = current;\n"
+        "\n"
+        "\t/* Get task credentials */\n"
+        "\tcred = get_task_cred(task);\n"
+        "\tif (!cred) {\n"
+        "\t\thdd_security_err(\"Failed to get task credentials\");\n"
+        "\t\treturn QDF_STATUS_E_FAILURE;\n"
+        "\t}\n"
+        "\n"
+        "\t/* Check for CAP_NET_RAW capability */\n"
+        "\thas_capability = capable(CAP_NET_RAW);\n"
+        "\n"
+        "\tput_cred(cred);\n"
+        "\n"
+        "\tif (!has_capability) {\n"
+    )
+    inject_cap_new = (
+        "\tbool has_capability = false;\n"
+        "\n"
+        "\thdd_security_debug(\"Checking injection capabilities\");\n"
+        "\n"
+        "\t/* Use current task if none specified */\n"
+        "\tif (!task)\n"
+        "\t\ttask = current;\n"
+        "\n"
+        "\t/* Check for CAP_NET_RAW capability */\n"
+        "\thas_capability = capable(CAP_NET_RAW);\n"
+        "\n"
+        "\tif (!has_capability) {\n"
+    )
+    if already_present(f, inject_cap_new) and not already_present(f, "cred = get_task_cred(task);"):
+        print("[wlan_hdd_inject_security.c dead cred fetch] already removed "
+              "-- skipping")
+    else:
+        fuzzy_replace(
+            f, inject_cap_old, inject_cap_new,
+            "wlan_hdd_inject_security.c remove dead get_task_cred/put_cred",
+            diagnose_needle="QDF_STATUS hdd_check_injection_capability(struct task_struct *task)")
 
     # --- Kbuild : wire the new object files + cppflag into the build.
     #     Three separate insertion points, confirmed against real file

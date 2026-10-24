@@ -87,26 +87,20 @@ jobs:
           path: injection_patch_report.log
           if-no-files-found: ignore
 
-      - name: DEBUG dump wma_txrx_node struct and usage context
+      - name: DEBUG find roam-in-progress check for a vdev
         run: |
           set +e
-          echo "=== struct wma_txrx_node definition ==="
-          grep -n "struct wma_txrx_node" vendor/qcom/opensource/wlan/qcacld-3.0/core/wma/inc/wma.h
-          LINE=$(grep -n "^struct wma_txrx_node {" vendor/qcom/opensource/wlan/qcacld-3.0/core/wma/inc/wma.h | head -1 | cut -d: -f1)
-          echo "struct starts at line ${LINE:-NONE}"
-          if [ -n "$LINE" ]; then sed -n "${LINE},$((LINE+150))p" vendor/qcom/opensource/wlan/qcacld-3.0/core/wma/inc/wma.h; fi
+          echo "=== grep whole qcacld tree for roam-in-progress style identifiers ==="
+          grep -rn "roam_in_progress\|roaming_in_progress\|is_roam_in_progress\|roam_synch_in_progress" vendor/qcom/opensource/wlan/qcacld-3.0/core/ | grep -v "\.rej:" | head -40
 
-          echo "=== roaming-related fields in that struct ==="
-          grep -n "roam" vendor/qcom/opensource/wlan/qcacld-3.0/core/wma/inc/wma.h | head -20
+          echo "=== grep for a CM/MLME API to query roam state for a vdev ==="
+          grep -rn "wlan_cm_is_vdev_roam\|cm_is_vdev_roaming\|mlme_is_roam\|wlan_vdev_mlme_is_.*roam\|csr_neighbor_roam_is_handoff_in_progress" vendor/qcom/opensource/wlan/qcacld-3.0/core/ --include=*.h | head -40
 
-          echo "=== channel-frequency-related fields in that struct ==="
-          grep -n "freq\|chan_width\|ch_freq" vendor/qcom/opensource/wlan/qcacld-3.0/core/wma/inc/wma.h | grep -v "^.*://" | head -30
+          echo "=== how does wma itself defer/check roam state elsewhere (existing code, not the patch) ==="
+          grep -rn "roam.*in.progress\|in.progress.*roam" vendor/qcom/opensource/wlan/qcacld-3.0/core/wma/src/*.c | grep -v "\.rej:" | head -40
 
-          echo "=== usage context in wma_frame_inject.c around line 687 ==="
-          sed -n '670,700p' vendor/qcom/opensource/wlan/qcacld-3.0/core/wma/src/wma_frame_inject.c
-
-          echo "=== usage context in wma_frame_inject.c around line 1418 ==="
-          sed -n '1405,1425p' vendor/qcom/opensource/wlan/qcacld-3.0/core/wma/src/wma_frame_inject.c
+          echo "=== what the patch file itself expected this check to look like (original intent) ==="
+          grep -n "roaming_in_progress\|roam_in_progress" patches/07_packet_injection.patch | head -20
           exit 0
 
       - name: Prepare kernel headers for external module

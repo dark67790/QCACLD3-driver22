@@ -87,11 +87,26 @@ jobs:
           path: injection_patch_report.log
           if-no-files-found: ignore
 
-      - name: DEBUG dump misplaced del_bss_resp location
+      - name: DEBUG dump wma_txrx_node struct and usage context
         run: |
           set +e
-          F=vendor/qcom/opensource/wlan/qcacld-3.0/core/wma/src/wma_utils.c
-          sed -n '4660,4695p' "$F"
+          echo "=== struct wma_txrx_node definition ==="
+          grep -n "struct wma_txrx_node" vendor/qcom/opensource/wlan/qcacld-3.0/core/wma/inc/wma.h
+          LINE=$(grep -n "^struct wma_txrx_node {" vendor/qcom/opensource/wlan/qcacld-3.0/core/wma/inc/wma.h | head -1 | cut -d: -f1)
+          echo "struct starts at line ${LINE:-NONE}"
+          if [ -n "$LINE" ]; then sed -n "${LINE},$((LINE+150))p" vendor/qcom/opensource/wlan/qcacld-3.0/core/wma/inc/wma.h; fi
+
+          echo "=== roaming-related fields in that struct ==="
+          grep -n "roam" vendor/qcom/opensource/wlan/qcacld-3.0/core/wma/inc/wma.h | head -20
+
+          echo "=== channel-frequency-related fields in that struct ==="
+          grep -n "freq\|chan_width\|ch_freq" vendor/qcom/opensource/wlan/qcacld-3.0/core/wma/inc/wma.h | grep -v "^.*://" | head -30
+
+          echo "=== usage context in wma_frame_inject.c around line 687 ==="
+          sed -n '670,700p' vendor/qcom/opensource/wlan/qcacld-3.0/core/wma/src/wma_frame_inject.c
+
+          echo "=== usage context in wma_frame_inject.c around line 1418 ==="
+          sed -n '1405,1425p' vendor/qcom/opensource/wlan/qcacld-3.0/core/wma/src/wma_frame_inject.c
           exit 0
 
       - name: Prepare kernel headers for external module

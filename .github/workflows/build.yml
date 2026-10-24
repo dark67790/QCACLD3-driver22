@@ -88,26 +88,16 @@ jobs:
           path: injection_patch_report.log
           if-no-files-found: ignore
 
-      - name: DEBUG dump remaining cfg80211.c hunks
+      - name: DEBUG confirm connect-path architecture
         run: |
           set +e
           F=vendor/qcom/opensource/wlan/qcacld-3.0/core/hdd/src/wlan_hdd_cfg80211.c
 
-          echo "=== 1: sme_roam_connect call site ==="
-          grep -n -B 15 -A 5 "sme_roam_connect(" "$F"
+          echo "=== any trace of the old functions at all? ==="
+          grep -n "wlan_hdd_cfg80211_connect_start\|wlan_hdd_cfg80211_join_ibss\|__wlan_hdd_cfg80211_connect\b\|hdd_dump_connect_req" "$F"
 
-          echo "=== 2: chandef.width call site ==="
-          grep -n -B 20 -A 5 "chandef.width" "$F"
-
-          echo "=== 3: hdd_dump_connect_req function ==="
-          LINE=$(grep -n "hdd_dump_connect_req" "$F" | head -1 | cut -d: -f1)
-          echo "found at line ${LINE:-NONE}"
-          if [ -n "$LINE" ]; then sed -n "${LINE},$((LINE+60))p" "$F"; fi
-
-          echo "=== 4: __wlan_hdd_cfg80211_connect span ==="
-          LINE2=$(grep -n "__wlan_hdd_cfg80211_connect(struct wiphy" "$F" | head -1 | cut -d: -f1)
-          echo "found at line ${LINE2:-NONE}"
-          if [ -n "$LINE2" ]; then sed -n "${LINE2},$((LINE2+120))p" "$F"; fi
+          echo "=== what connect-manager style functions exist instead? ==="
+          grep -n "osif_cm_connect\|wlan_cm_start_connect\|osif_pre_cm_connect\|__wlan_hdd_cm_connect\|wlan_hdd_cm_connect" "$F" | head -20
 
           exit 0
 

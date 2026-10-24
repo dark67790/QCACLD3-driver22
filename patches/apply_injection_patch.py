@@ -27,6 +27,16 @@ tree-specific logic the patch's baseline never had):
   - Kbuild -Wmaybe-uninitialized / -Wframe-larger-than block (unrelated
     compiler-warning housekeeping)
 
+Confirmed NOT APPLICABLE (not drifted -- the targeted code no longer
+exists in this tree at all; see KNOWN_INAPPLICABLE_REJECTS for the full
+reasoning, kept there so it prints every run rather than being buried):
+  - cfg80211.c: 7 hunks touching the legacy STA/IBSS connect path
+    (wlan_hdd_cfg80211_connect_start, wlan_hdd_cfg80211_join_ibss,
+    __wlan_hdd_cfg80211_connect, hdd_dump_connect_req) -- this tree has
+    moved that flow to the Connection Manager architecture
+    (wlan_hdd_cm_connect) and none of those four functions exist here.
+    Unrelated to monitor mode / frame injection either way.
+
 Run from the repo root (the directory containing vendor/qcom/opensource/wlan).
 Exits non-zero on any failure so CI surfaces it instead of silently
 producing a half-patched tree.
@@ -48,6 +58,39 @@ PATCH_FILE = Path(__file__).resolve().parent / "07_packet_injection.patch"
 
 FAILURES = []
 ATTEMPTED_FILES = set()  # files this script has any hand-merge logic for at all
+
+# .rej files confirmed (via live CI ground truth, not guessed) to contain
+# ONLY hunks that are genuinely not applicable to this tree -- not merely
+# drifted, but targeting code that no longer exists at all. The content
+# heuristic in check_unaddressed_rejects() can't distinguish "nothing
+# addresses this" from "this was investigated and found inapplicable", so
+# these are listed explicitly, with the reasoning kept here (and printed
+# every run) rather than silently assumed forever.
+KNOWN_INAPPLICABLE_REJECTS = {
+    "qcacld-3.0/core/hdd/src/wlan_hdd_cfg80211.c.rej": (
+        "7 of its 9 hunks target the legacy STA/IBSS connect path -- "
+        "wlan_hdd_cfg80211_connect_start(), wlan_hdd_cfg80211_join_ibss(), "
+        "__wlan_hdd_cfg80211_connect(), hdd_dump_connect_req() -- and "
+        "confirmed via live CI that NONE of those four names appear "
+        "anywhere in this file at all (not drifted -- entirely absent). "
+        "This tree's STA/IBSS connect flow has been replaced wholesale by "
+        "the Connection Manager architecture (wlan_hdd_cm_connect(), "
+        "confirmed present at the call site that used to invoke the old "
+        "functions). These 7 hunks are pre-existing upstream connect-flow "
+        "diagnostic-logging changes that happened to be bundled into the "
+        "same patch file as the packet-injection feature -- unrelated to "
+        "monitor mode or frame injection, which lives entirely in "
+        "__hdd_hard_start_xmit, hdd_is_monitor_tx_dev / "
+        "hdd_monitor_mode_tx_inject, wma_frame_inject.c, the qca_vendor.h "
+        "enums, wlan_hdd_rx_monitor.c, and the cfg80211 vendor-command "
+        "wiring -- all handled elsewhere in this script. There is no "
+        "equivalent code left to hand-merge these into. The other 2 "
+        "hunks in this same reject (the FEATURE_FRAME_INJECTION_SUPPORT "
+        "include guard and the vendor-command array entry) ARE applied, "
+        "via the 'cfg80211.c include' / 'cfg80211.c vendor cmd array' "
+        "fuzzy_replace calls in apply_hand_merges()."
+    ),
+}
 
 
 def run_bulk_patch():
@@ -1257,6 +1300,10 @@ def check_unaddressed_rejects():
     reject). If most of a reject's added content is nowhere in the file,
     it's very likely a hunk nothing has ever actually handled."""
     for rej in sorted(WLAN_DIR.rglob("*.rej")):
+        rel = str(rej.relative_to(WLAN_DIR))
+        if rel in KNOWN_INAPPLICABLE_REJECTS:
+            print(f"[known-inapplicable] {rel} -- {KNOWN_INAPPLICABLE_REJECTS[rel]}")
+            continue
         target = rej.with_suffix("").resolve()
         if target not in ATTEMPTED_FILES:
             FAILURES.append(

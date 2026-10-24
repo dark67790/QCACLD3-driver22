@@ -1034,7 +1034,11 @@ def apply_hand_merges():
         "\n"
         "\t/* Check for CAP_NET_RAW capability */\n"
         "\thas_capability = capable(CAP_NET_RAW);\n"
-        "\n"
+        "\t\n"  # confirmed via live CI (_diagnose()'s tab-visible dump): this
+                 # "blank" line carries a stray trailing tab in the real file,
+                 # unlike every other blank line in this function -- v12's
+                 # anchor assumed a true empty line here and missed by
+                 # exactly this one line.
         "\tput_cred(cred);\n"
         "\n"
         "\tif (!has_capability) {\n"

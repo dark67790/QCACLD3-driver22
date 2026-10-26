@@ -87,10 +87,10 @@ jobs:
           path: injection_patch_report.log
           if-no-files-found: ignore
 
-      - name: DEBUG dump hdd_adapter struct field context for new atomic field
+      - name: DEBUG dump end of __wlan_hdd_cfg80211_set_mon_ch
         run: |
           set +e
-          sed -n '1415,1435p' vendor/qcom/opensource/wlan/qcacld-3.0/core/hdd/inc/wlan_hdd_main.h | cat -A
+          sed -n '22954,22990p' vendor/qcom/opensource/wlan/qcacld-3.0/core/hdd/src/wlan_hdd_cfg80211.c | cat -A
           exit 0
 
       - name: Prepare kernel headers for external module

@@ -87,22 +87,10 @@ jobs:
           path: injection_patch_report.log
           if-no-files-found: ignore
 
-      - name: DEBUG dump monitor channel-switch path for stability fix
+      - name: DEBUG dump hdd_adapter struct field context for new atomic field
         run: |
           set +e
-          echo "=== __wlan_hdd_cfg80211_set_mon_ch full body ==="
-          grep -n "__wlan_hdd_cfg80211_set_mon_ch" -A 140 \
-            vendor/qcom/opensource/wlan/qcacld-3.0/core/hdd/src/wlan_hdd_cfg80211.c \
-            | cat -A | head -200
-
-          echo "=== ch_switch_in_progress: every declaration and use site ==="
-          grep -rn "ch_switch_in_progress" \
-            vendor/qcom/opensource/wlan/qcacld-3.0/core/hdd/inc/ \
-            vendor/qcom/opensource/wlan/qcacld-3.0/core/hdd/src/
-
-          echo "=== confirm policy_mgr_check_and_set_hw_mode_for_channel_switch + policy_mgr_is_current_hwmode_dbs exist ==="
-          grep -rn "policy_mgr_check_and_set_hw_mode_for_channel_switch\|policy_mgr_is_current_hwmode_dbs" \
-            vendor/qcom/opensource/wlan/qcacld-3.0/components/cmn_services/policy_mgr/inc/wlan_policy_mgr_api.h
+          sed -n '1415,1435p' vendor/qcom/opensource/wlan/qcacld-3.0/core/hdd/inc/wlan_hdd_main.h | cat -A
           exit 0
 
       - name: Prepare kernel headers for external module

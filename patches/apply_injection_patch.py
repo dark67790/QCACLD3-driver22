@@ -122,16 +122,11 @@ def _normalize_for_match(block: str) -> str:
     Newlines are preserved as literal newlines (not relaxed), since we DO
     want to catch genuine structural differences in line breaks."""
     escaped = re.escape(block)
-    # re.escape turns each space/tab into a literal char; collapse any run
-    # of escaped horizontal whitespace into a flexible \s+ (but not \n).
     escaped = re.sub(r"(?:\\ |\\\t)+", r"[ \\t]+", escaped)
     return escaped
 
 
 def _diagnose(path: Path, needle: str, context_lines: int = 70):
-    """On an anchor miss, locate a much smaller near-certain substring and
-    dump real surrounding file content to the CI log, so we get ground
-    truth from a single run instead of a manual back-and-forth."""
     text = path.read_text()
     idx = text.find(needle)
     if idx == -1:
@@ -145,16 +140,10 @@ def _diagnose(path: Path, needle: str, context_lines: int = 70):
     print(f"    DIAGNOSE: needle found at line {line_no}, real content "
           f"(lines {start + 1}-{end}):")
     for i in range(start, end):
-        # render tabs visibly so indentation-only drift is obvious in the log
         print(f"    {i + 1:>6}\t{lines[i].replace(chr(9), '<TAB>')}")
 
 
 def already_present(path: Path, needle: str) -> bool:
-    """Idempotency check: some hunks succeed in the bulk patch step (possibly
-    landing correctly even when the hand-merge step's wider anchor doesn't
-    match due to surrounding tree-specific content). Check for the smallest
-    reliable signal before attempting a hand-merge, so already-applied work
-    isn't misreported as a failure."""
     ATTEMPTED_FILES.add(path.resolve())
     if not path.exists():
         return False
@@ -196,18 +185,13 @@ def fuzzy_replace(path: Path, old_block: str, new_block: str, label: str,
 
 
 def dump_rejects():
-    """Dump full ground-truth context for every remaining .rej file in one
-    pass: the literal expected hunk plus the real file's actual content at
-    that location. Runs after Step 1 so any NEW divergence (files we have
-    no hand-merge fix for yet) surfaces in this run's log instead of
-    requiring another manual round-trip."""
     rejects = sorted(WLAN_DIR.rglob("*.rej"))
     if not rejects:
         print("\n(no .rej files after bulk patch step -- nothing to diagnose)")
         return
     print(f"\n{'=' * 60}\nDIAGNOSING {len(rejects)} REMAINING .rej FILE(S)\n{'=' * 60}")
     for rej in rejects:
-        target = rej.with_suffix("")  # strip trailing .rej
+        target = rej.with_suffix("")
         print(f"\n--- {rej.relative_to(WLAN_DIR)} ---")
         rej_text = rej.read_text()
         print("EXPECTED (literal hunk from patch):")
@@ -235,11 +219,6 @@ KEYWORD_BLACKLIST = {
 
 
 def _extract_defs_from_added_lines(added_text: str):
-    """Given just the '+' lines of ONE hunk (already de-prefixed, in
-    order), find function definitions within that added block only.
-    Scoped to a single hunk's additions -- never the full file -- so
-    pre-existing #ifdef/#else branch-pairs elsewhere in the file never
-    enter into this at all."""
     lines = added_text.split("\n")
     names = []
     i, n = 0, len(lines)
@@ -277,14 +256,6 @@ def _extract_defs_from_added_lines(added_text: str):
 
 
 def get_patch_added_function_names():
-    """Parse the patch itself (not any target tree) to find the narrow,
-    specific list of function names it newly defines in EXISTING files
-    (files without 'new file mode' -- brand new files can't collide with
-    anything). Scoped to each hunk's own '+' lines only, which is what
-    keeps this accurate: we're asking 'what does the patch add', not
-    'find every function anywhere', so the vast pre-existing codebase
-    (full of legitimate #ifdef/#else same-name branch-pairs) never enters
-    into the analysis. Returns {relative_path: set(names)}."""
     patch_text = PATCH_FILE.read_text()
     parts = re.split(r"^diff --git a/(\S+) b/\S+$", patch_text, flags=re.M)
     pairs = list(zip(parts[1::2], parts[2::2]))
@@ -293,7 +264,7 @@ def get_patch_added_function_names():
         if not path.endswith(".c"):
             continue
         if "new file mode" in content[:500]:
-            continue  # brand new file -- nothing pre-existing to collide with
+            continue
         names = set()
         for hunk in re.split(r"^@@.*@@.*$", content, flags=re.M)[1:]:
             added = "\n".join(
@@ -308,15 +279,8 @@ def get_patch_added_function_names():
 
 
 def _build_condition_paths(text: str):
-    """For every line, compute the stack of (block_id, branch) identifying
-    which #if/#ifdef nesting it's inside. Two lines are only genuinely
-    mutually-exclusive if they share a common block_id but differ in
-    branch at that id -- NOT just because some #else exists somewhere
-    between them in the file (which could belong to a totally unrelated
-    conditional for a different feature entirely, especially across a
-    1000+ line gap)."""
     lines = text.split("\n")
-    stack = []  # list of [block_id, branch]
+    stack = []
     next_id = 0
     paths = {}
     for i, line in enumerate(lines, start=1):
@@ -338,13 +302,11 @@ def _mutually_exclusive(path_a, path_b):
     a_map, b_map = dict(path_a), dict(path_b)
     shared = set(a_map) & set(b_map)
     if not shared:
-        return False  # no common conditional at all -- not exclusive
+        return False
     return any(a_map[bid] != b_map[bid] for bid in shared)
 
 
 def _find_matching_paren(text: str, open_idx: int) -> int:
-    """text[open_idx] must be '('. Returns the index of its matching ')',
-    tracking nesting depth, or -1 if unbalanced before EOF."""
     depth = 0
     i = open_idx
     n = len(text)
@@ -360,15 +322,6 @@ def _find_matching_paren(text: str, open_idx: int) -> int:
 
 
 def _is_function_definition(text: str, open_paren_idx: int) -> bool:
-    """text[open_paren_idx] must be '('. A match is a genuine function
-    DEFINITION only if its parameter list's matching ')' is followed
-    (after only whitespace) by '{'. A call ends in ';' or ',' or ')'
-    inside a larger expression; a forward declaration ends in ';'.
-    Without this check, the duplicate-function scanner below false-flags
-    an ordinary call site (e.g. `hdd_monitor_mode_tx_inject(adapter, dev,
-    skb);`) as a second definition, since the scan regex only looks for
-    "name(" at the start of a non-comment line and doesn't care what
-    follows the closing paren."""
     close_idx = _find_matching_paren(text, open_paren_idx)
     if close_idx == -1:
         return False
@@ -380,22 +333,6 @@ def _is_function_definition(text: str, open_paren_idx: int) -> bool:
 
 
 def _delete_function_by_doc_marker(path: Path, doc_marker: str, label: str) -> bool:
-    """Delete one complete function definition, located structurally
-    instead of by a literal transcription of its full body: find the
-    short, distinctive doc_marker inside its kernel-doc comment, walk
-    back to that comment's opening '/**', walk forward to the function's
-    opening '{', then brace-balance to the matching closing '}' and
-    delete everything from the comment through that brace (plus one
-    trailing blank line, if present).
-
-    This replaces a fragile literal-body fuzzy_replace for cases like
-    wlan_hdd_cfg80211_get_channel, where the body itself (not just its
-    surroundings) has already been shown to drift between snapshots --
-    a hand-transcribed anchor for the whole function keeps re-breaking
-    on each new divergence inside the body. Brace-matching is correct
-    regardless of what's inside, as long as the doc comment and a '{'
-    immediately following the signature are present -- true for every
-    kernel-doc-commented function in this codebase."""
     ATTEMPTED_FILES.add(path.resolve())
     if not path.exists():
         FAILURES.append(f"[{label}] file not found: {path}")
@@ -442,8 +379,6 @@ def _delete_function_by_doc_marker(path: Path, doc_marker: str, label: str) -> b
             f"never balanced -- refusing to guess, needs a human")
         return False
 
-    # Consume up to one trailing blank line after the closing brace so we
-    # don't leave a double blank line behind.
     end = brace_close + 1
     if text[end:end + 1] == "\n":
         end += 1
@@ -460,10 +395,6 @@ def _delete_function_by_doc_marker(path: Path, doc_marker: str, label: str) -> b
 
 
 def _diagnose_duplicate(path: Path, name: str, lines_list, context_lines: int = 24):
-    """Dump real context around each occurrence of a duplicated function name,
-    the same way _diagnose() does for a missed .rej anchor, so a genuine new
-    divergence (one this script has no hand-merge logic for yet) gets ground
-    truth in this run's log instead of requiring a guessed fix."""
     lines = path.read_text().splitlines()
     for ln in lines_list:
         lo = max(0, ln - 1 - context_lines // 2)
@@ -475,14 +406,6 @@ def _diagnose_duplicate(path: Path, name: str, lines_list, context_lines: int = 
 
 
 def scan_for_duplicate_functions():
-    """For the narrow, patch-derived list of function names (see
-    get_patch_added_function_names), check whether the FINAL merged file
-    defines each name more than once -- and if so, whether the two
-    definitions sit in mutually-exclusive #ifdef/#else branches (legal,
-    normal kernel style, not a bug) versus truly both being live (the
-    bug class behind hdd_disable_monitor_mode and
-    wlan_hdd_cfg80211_get_channel). Runs after hand-merges so it reflects
-    final state."""
     print(f"\n{'=' * 60}\nSCANNING FOR DUPLICATE FUNCTION DEFINITIONS\n{'=' * 60}")
     name_map = get_patch_added_function_names()
     total_names = sum(len(v) for v in name_map.values())
@@ -499,32 +422,18 @@ def scan_for_duplicate_functions():
         text = target.read_text()
         paths = _build_condition_paths(text)
         for name in sorted(names):
-            # (?!\s*[*/]) excludes comment lines -- kernel doc convention
-            # writes "* funcname() - description" which would otherwise
-            # false-match. [\w \t\*]  (not \s) keeps the flexible middle
-            # portion from crossing newlines, since \s matches '\n' too
-            # and would otherwise let this bridge into unrelated lines.
             pattern = re.compile(
                 r"^(?!\s*[*/])(?:static[ \t]+)?(?:inline[ \t]+)?"
                 r"[\w \t\*]*?\b" + re.escape(name) + r"[ \t]*\(", re.M)
-            # Pattern alone can't distinguish a definition from a call or a
-            # forward declaration -- "name(" at line-start matches a call
-            # like "hdd_monitor_mode_tx_inject(adapter, dev, skb);" just as
-            # readily as the real definition. Confirm each match's parameter
-            # list is followed by '{' (a definition) before counting it.
             match_lines = []
             for m in pattern.finditer(text):
-                open_paren_idx = m.end() - 1  # pattern consumes the '(' itself
+                open_paren_idx = m.end() - 1
                 if (text[open_paren_idx] == "("
                         and _is_function_definition(text, open_paren_idx)):
                     match_lines.append(text.count("\n", 0, m.start()) + 1)
             if len(match_lines) <= 1:
                 print(f"  ok  {name}  ({rel}) -- {len(match_lines)} occurrence(s)")
                 continue
-            # 2+ occurrences -- legitimate only if every consecutive pair
-            # is genuinely under mutually-exclusive branches of the SAME
-            # conditional (shared block_id, different branch), not just
-            # separated by an unrelated #else somewhere else in the file.
             branch_separated = True
             for a, b in zip(match_lines, match_lines[1:]):
                 if not _mutually_exclusive(paths.get(a, ()), paths.get(b, ())):
@@ -549,28 +458,15 @@ def scan_for_duplicate_functions():
 def apply_hand_merges():
     print("\n== Step 2: hand-merged fixes for hunks that diverged from baseline ==")
 
-    # --- rx_monitor.h : hdd_disable_monitor_mode(void) already exists
-    #     natively in this tree (confirmed: declared at the prototype AND
-    #     stub, called from main.c with no args) -- it predates this patch
-    #     and is unrelated to it. The patch's own (struct net_device *dev)
-    #     version is dead code (grep of the full 44-file patch confirms
-    #     nothing calls it), so we do NOT add a conflicting declaration
-    #     here. See the wlan_hdd_rx_monitor.c fix below instead, which
-    #     removes the patch's duplicate definition and splices the one
-    #     line that matters (hdd_frame_inject_disable) into the real fn. ---
     f = HDD_SRC / "wlan_hdd_rx_monitor.h"
     if already_present(f, "hdd_disable_monitor_mode("):
-        print("[rx_monitor.h] hdd_disable_monitor_mode already present "
-              "(this tree's own, unrelated function) -- correctly left alone")
+        print("[rx_monitor.h] hdd_disable_monitor_mode already present -- correctly left alone")
     else:
         msg = ("[rx_monitor.h] expected hdd_disable_monitor_mode to already "
                "exist in this tree and it doesn't -- tree has changed more "
                "than expected, needs a human to re-check")
         FAILURES.append(msg)
 
-    # --- rx_monitor.c : conditional include (often already landed via the
-    #     bulk patch step even when the hand-merge anchor below doesn't
-    #     match due to tree-specific surrounding content) ---
     f = HDD_SRC / "wlan_hdd_rx_monitor.c"
     if already_present(f, '#include "wlan_hdd_frame_inject.h"'):
         print("[rx_monitor.c include] already present -- skipping")
@@ -583,22 +479,6 @@ def apply_hand_merges():
             "rx_monitor.c include",
             diagnose_needle='#include "wlan_hdd_rx_monitor.h"')
 
-    # --- rx_monitor.c : the patch adds its OWN hdd_disable_monitor_mode()
-    #     with a (struct net_device *dev) signature, which collides with
-    #     this tree's pre-existing (void)-signature function of the same
-    #     name -- confirmed via live grep as two full definitions in the
-    #     same file, which will not compile. Nothing in the 44-file patch
-    #     ever calls the (dev) version, so it's safe to delete outright;
-    #     splice its one useful line (hdd_frame_inject_disable) into the
-    #     real (void) function instead, using hdd_get_adapter(hdd_ctx,
-    #     QDF_MONITOR_MODE) to reach the monitor adapter without a dev
-    #     pointer in scope -- the same idiom this tree already uses
-    #     elsewhere (wlan_hdd_state_ctrl_param_write) to find it. ---
-    # The patch's own duplicate (struct net_device *dev) version may or may
-    # not have landed depending on fuzz tolerance in Step 1 -- handle both
-    # outcomes instead of assuming one. Either way the end state should be:
-    # exactly one hdd_disable_monitor_mode(void), with frame-inject-disable
-    # spliced in via hdd_get_adapter(hdd_ctx, QDF_MONITOR_MODE).
     splice_marker = "hdd_get_adapter(hdd_ctx, QDF_MONITOR_MODE)"
     dup_marker = "int hdd_disable_monitor_mode(struct net_device *dev)"
     void_fn = (
@@ -635,9 +515,6 @@ def apply_hand_merges():
     if already_present(f, splice_marker):
         print("[rx_monitor.c disable-mode splice] already present -- skipping")
     elif already_present(f, dup_marker):
-        # fuzzy match let the patch's conflicting duplicate land -- remove
-        # it entirely (confirmed unused anywhere in the 44-file patch) and
-        # splice into the real function in one combined edit.
         dup_fn = (
             "/**\n"
             " * hdd_disable_monitor_mode() - Disable monitor mode\n"
@@ -683,13 +560,10 @@ def apply_hand_merges():
                       "rx_monitor.c remove duplicate, splice into real fn",
                       diagnose_needle=dup_marker)
     else:
-        # Common case under tighter fuzz: the duplicate never landed, the
-        # tree's original single function is untouched -- extend it directly.
         fuzzy_replace(f, void_fn, spliced_void_fn,
                       "rx_monitor.c splice into existing fn (no duplicate present)",
                       diagnose_needle="int hdd_disable_monitor_mode(void)")
 
-    # --- cfg80211.c : conditional include + vendor cmd array entry ---
     f = HDD_SRC / "wlan_hdd_cfg80211.c"
     fuzzy_replace(f,
         '#include "wlan_hdd_cfr.h"\n',
@@ -708,31 +582,7 @@ def apply_hand_merges():
         "#endif\n",
         "cfg80211.c vendor cmd array")
 
-    # --- wlan_hdd_frame_inject.h : FEATURE_FRAME_INJECTION_VENDOR_COMMANDS
-    #     macro is missing .policy on all three vendor command entries it
-    #     defines. Confirmed via live CI, two rounds: the module loads and
-    #     resolves all symbols fine now, but wiphy_register() itself fails
-    #     with errno -22, hitting a WARN_ON at the exact kernel source line
-    #     the user pasted from their own tree (net/wireless/core.c):
-    #         if (WARN_ON(!rdev->wiphy.vendor_commands[i].policy))
-    #                 return -EINVAL;
-    #     In C a designated initializer with no ".policy = ..." line leaves
-    #     it implicitly NULL, so all three entries this macro defines trip
-    #     that check and wiphy_register() -- and therefore the ENTIRE
-    #     wlan0 interface -- never comes up. This is a bug in the patch's
-    #     own macro definition, not something introduced by hand-merging.
-    #     The kernel's own comment just above that check names the fix:
-    #     "can be explicitly set to VENDOR_CMD_RAW_DATA which is non-NULL"
-    #     -- the standard cfg80211 sentinel for "this command parses its
-    #     own raw netlink data, skip automatic policy validation", which
-    #     matches these three handlers (none of them define an nla_policy
-    #     array anywhere in the patch). Confirmed real file whitespace via
-    #     `cat -A` on the actual built file before anchoring (tabs for
-    #     indentation, two tabs + one space on the wrapped flag-continuation
-    #     lines) -- not re-typed from the raw patch diff text, after the
-    #     stray-tab anchor miss earlier this session taught that lesson. ---
     f = HDD_INC / "wlan_hdd_frame_inject.h"
-
     vendor_cmds_old = (
         "#define FEATURE_FRAME_INJECTION_VENDOR_COMMANDS \\\n"
         "{ \\\n"
@@ -787,24 +637,17 @@ def apply_hand_merges():
         "}\n"
     )
     if already_present(f, "\t.policy = VENDOR_CMD_RAW_DATA, \\\n\t.doit = hdd_frame_inject_netlink"):
-        print("[wlan_hdd_frame_inject.h vendor cmd .policy] already present "
-              "-- skipping")
+        print("[wlan_hdd_frame_inject.h vendor cmd .policy] already present -- skipping")
     else:
         fuzzy_replace(
             f, vendor_cmds_old, vendor_cmds_new,
             "wlan_hdd_frame_inject.h add missing .policy to vendor commands",
             diagnose_needle="define FEATURE_FRAME_INJECTION_VENDOR_COMMANDS")
 
-    # --- main.h : injection_ctx field (often already landed via the bulk
-    #     patch step even when the hand-merge anchor below doesn't match
-    #     due to tree-specific fields between the two anchor lines) ---
     f = HDD_INC / "wlan_hdd_main.h"
     if already_present(f, "struct hdd_injection_ctx *injection_ctx;"):
         print("[main.h injection_ctx field] already present -- skipping")
     else:
-        # Confirmed stable across two independent runs: this single line is
-        # a reliable anchor regardless of what surrounds it (field order /
-        # #ifdef blocks around it drift between runs/snapshots, this doesn't).
         fuzzy_replace(f,
             "\tqdf_atomic_t net_dev_hold_ref_count[NET_DEV_HOLD_ID_MAX];\n",
             "\tqdf_atomic_t net_dev_hold_ref_count[NET_DEV_HOLD_ID_MAX];\n"
@@ -813,9 +656,6 @@ def apply_hand_merges():
             "main.h injection_ctx field",
             diagnose_needle="net_dev_hold_ref_count[NET_DEV_HOLD_ID_MAX]")
 
-    # --- main.c : __hdd_mon_open -- set carrier/queues up, keep existing
-    #     BBM policy block this tree already has that the patch's baseline
-    #     didn't ---
     f = HDD_SRC / "wlan_hdd_main.c"
     fuzzy_replace(f,
         "\tret = hdd_set_mon_rx_cb(dev);\n\n"
@@ -850,35 +690,6 @@ def apply_hand_merges():
         "\treturn 0;\n}",
         "main.c __hdd_mon_open")
 
-    # --- wma.h : legacy WMA_LOGE/W/D/I macro compatibility shim. The
-    #     patch was authored against an older baseline where this family
-    #     was still the logging convention in core/wma/src/*.c -- confirmed
-    #     by context lines in the patch itself (e.g. the unchanged
-    #     "WMA_LOGE(...)" line around the Tx-complete-callback check) that
-    #     no longer match this tree's actual content there at all (this
-    #     tree already reads wma_err()/wma_warn()/etc. at those spots,
-    #     confirmed via live grep -- the module-wide rename predates this
-    #     patch and is unrelated to it). WMA_LOGE itself is not defined
-    #     ANYWHERE in this tree (confirmed via a repo-wide grep turning up
-    #     zero #define sites), so every "+" line the patch adds using it
-    #     is an implicit-function-declaration compile error, confirmed via
-    #     live CI across all three files that carry it: the new
-    #     wma_frame_inject.c (7 call sites, confirmed to #include "wma.h"
-    #     as its first header), plus one hand-merged call each in
-    #     wma_main.c (this fix, below) and wma_mgmt.c (landed via the bulk
-    #     patch step, no hand-merge needed). Fixing each call site
-    #     individually can't be fully verified in one CI round-trip since
-    #     parallel make aborts after the first failures, so a build might
-    #     not even reach every file that has the problem yet -- one
-    #     compatibility shim in wma.h, right next to the real wma_err/
-    #     wma_warn/wma_debug/wma_info definitions it maps onto, reaches
-    #     every file that already #include "wma.h" (which every WMA-layer
-    #     source file in this patch does) regardless of how far the build
-    #     gets. WMA_LOGW/D/I are included too even though only WMA_LOGE is
-    #     confirmed to land in compiled code -- the mapping itself is
-    #     fully grounded (wma.h's own real macros, same params... call
-    #     convention), so including the other three is a zero-risk hedge,
-    #     not a guess. ---
     f = WMA_INC / "wma.h"
     wma_log_macros = (
         "#define wma_alert(params...) QDF_TRACE_FATAL(QDF_MODULE_ID_WMA, params)\n"
@@ -907,8 +718,6 @@ def apply_hand_merges():
                       "wma.h legacy WMA_LOGE/W/D/I shim",
                       diagnose_needle="#define wma_err_rl(params...)")
 
-    # --- wma_main.c : wma_open -- inject queue init, after this tree's
-    #     extra wma_trace_init() call ---
     f = WMA_SRC / "wma_main.c"
     fuzzy_replace(f,
         "\twma_register_mws_coex_events(wma_handle);\n"
@@ -924,50 +733,6 @@ def apply_hand_merges():
         "\t}\n\n\treturn QDF_STATUS_SUCCESS;",
         "wma_main.c wma_open injection queue init")
 
-    # --- wma_utils.c : wma_mon_mlme_vdev_down_send -- del_bss_resp alloc.
-    #     The patch's hunk for this function is actually TWO separate
-    #     hunks: one adding "struct del_bss_resp *resp;" at the top of the
-    #     function (@@ -4690,6 +4690,7 @@, a 1-line addition), and one
-    #     adding the resp=alloc/use block near the end (@@ -4703,10
-    #     +4704,15 @@). Only the second one had hand-merge logic in this
-    #     script -- the first was silently dropped as an unaddressed .rej
-    #     (the file was already in ATTEMPTED_FILES because of the second
-    #     hunk's fix, so check_unaddressed_rejects() never flagged it).
-    #     Confirmed via live CI: 'use of undeclared identifier resp' at
-    #     every use site below. struct del_bss_resp is a real, unrenamed
-    #     type (wlan_mlme_main.h, fields status/vdev_id -- matches what the
-    #     usage code assumes) and both wma_internal.h and wlan_mlme_main.h
-    #     are already included in this file, so only the local declaration
-    #     itself is missing.
-    #     Anchored on the function's own signature (unique -- the name
-    #     appears once) rather than the declaration list's text alone,
-    #     since wma_mon_mlme_vdev_stop_send() right above it has an
-    #     identical-looking 3-line declaration block that would otherwise
-    #     make the anchor ambiguous. Inserted as the LAST declaration,
-    #     before the function's first statement -- not right before its
-    #     point of use -- to avoid the exact -Wdeclaration-after-statement
-    #     class of bug already hit and fixed once this run in
-    #     __hdd_hard_start_xmit. ---
-    #     UPDATE (confirmed via a second live CI round): the bulk patch
-    #     step's --fuzz=2 actually DID apply this declaration hunk on a
-    #     later run -- just into the wrong function. wma_wlm_stats_req(),
-    #     an unrelated function with its own "QDF_STATUS status;" as its
-    #     second-to-last declaration, matched the hunk's thin surviving
-    #     context well enough under heavy fuzz, so "struct del_bss_resp
-    #     *resp;" landed there instead -- as a dead, never-referenced
-    #     local, confirmed via live CI dump. The v8 idempotency check
-    #     (already_present(f, "struct del_bss_resp *resp;"), a bare
-    #     file-wide substring search with no location awareness) saw that
-    #     text existed SOMEWHERE in the file and concluded the fix was
-    #     already done, silently skipping the real insertion into
-    #     wma_mon_mlme_vdev_down_send entirely -- exactly the kind of gap
-    #     check_unaddressed_rejects() was just hardened against, except
-    #     this one lives in an idempotency check instead. Fixed by scoping
-    #     both checks to the actual function bodies: clean up the
-    #     misplaced declaration in wma_wlm_stats_req (also sidesteps a
-    #     likely -Wunused-variable/-Werror once it's unused there), and
-    #     check for the REAL fix's presence using the full anchor-plus-
-    #     declaration text, not the declaration text alone. ---
     f = WMA_SRC / "wma_utils.c"
     down_send_decl_anchor = (
         "QDF_STATUS wma_mon_mlme_vdev_down_send(struct vdev_mlme_obj *vdev_mlme,\n"
@@ -989,8 +754,7 @@ def apply_hand_merges():
     )
 
     if already_present(f, down_send_decl_fixed):
-        print("[wma_utils.c del_bss_resp declaration] already present in "
-              "wma_mon_mlme_vdev_down_send -- skipping")
+        print("[wma_utils.c del_bss_resp declaration] already present in wma_mon_mlme_vdev_down_send -- skipping")
     else:
         if already_present(f, wlm_stats_misplaced_anchor):
             fuzzy_replace(
@@ -1017,47 +781,15 @@ def apply_hand_merges():
         "\t}\n\n\treturn status;",
         "wma_utils.c del_bss_resp alloc")
 
-    # --- wma_frame_inject.c : struct wma_txrx_node field-name mismatches.
-    #     wma_frame_inject.c is a brand-new file added entirely by the
-    #     patch (nothing pre-existing to preserve), so these are plain
-    #     text substitutions rather than context-anchored hand-merges --
-    #     but the replacement names are still ground-truth-confirmed via
-    #     two live-CI diagnostic rounds, not guessed:
-    #
-    #     1) iface->roaming_in_progress -- struct wma_txrx_node has NO
-    #        per-vdev "roaming in progress" boolean field in this tree at
-    #        all. Confirmed via full struct dump: the only similarly-named
-    #        fields are plm_in_progress (FEATURE_WLAN_ESE -- an unrelated
-    #        PLM feature) and extscan_in_progress (FEATURE_WLAN_EXTSCAN --
-    #        also unrelated). Clang's "did you mean plm_in_progress?" is a
-    #        spelling-similarity guess, not a semantic match, and was NOT
-    #        used. Roam-in-progress tracking in this tree is instead a
-    #        function call: wma.h declares
-    #        "bool wma_is_roam_in_progress(uint32_t vdev_id);" (defined in
-    #        wma_data.c), and it is already used for this exact
-    #        defer-because-roaming pattern elsewhere in this same codebase
-    #        at wma_mgmt.c:364 ("Ignore STA kick out since roaming is in
-    #        progress"). vdev_id is already in scope at the
-    #        wma_frame_inject.c call site and wma.h is already included
-    #        (confirmed earlier), so this is a direct drop-in swap.
-    #
-    #     2) wma_handle->interfaces[vdev_id].mhz -- struct wma_txrx_node
-    #        has no "mhz" field, but does have "uint32_t ch_freq;" on the
-    #        exact same struct, documented as "@ch_freq: channel
-    #        frequency" -- same per-vdev scope, same integer type, same
-    #        semantic (channel frequency used to set tx_chanfreq). ---
     f = WMA_SRC / "wma_frame_inject.c"
-
     roam_check_old = "\tif (iface->roaming_in_progress) {\n"
     roam_check_new = "\tif (wma_is_roam_in_progress(vdev_id)) {\n"
     if already_present(f, roam_check_new):
-        print("[wma_frame_inject.c roaming_in_progress fix] already present "
-              "-- skipping")
+        print("[wma_frame_inject.c roaming_in_progress fix] already present -- skipping")
     else:
         fuzzy_replace(
             f, roam_check_old, roam_check_new,
-            "wma_frame_inject.c roaming_in_progress -> "
-            "wma_is_roam_in_progress(vdev_id)",
+            "wma_frame_inject.c roaming_in_progress -> wma_is_roam_in_progress(vdev_id)",
             diagnose_needle="if (iface->roaming_in_progress")
 
     mhz_old = (
@@ -1075,33 +807,7 @@ def apply_hand_merges():
                       "wma_frame_inject.c .mhz -> .ch_freq",
                       diagnose_needle="interfaces[vdev_id].mhz")
 
-    # --- wlan_hdd_inject_security.c : hdd_check_injection_capability()
-    #     fetches a task's cred via get_task_cred()/put_cred() but NEVER
-    #     actually reads it -- the real decision is "has_capability =
-    #     capable(CAP_NET_RAW);", which always checks current's own
-    #     capabilities regardless of the cred fetched (capable() doesn't
-    #     take a cred argument at all). Confirmed via live CI on the real
-    #     device: on this Samsung KDP-hardened kernel, get_task_cred() /
-    #     put_cred() pull in kdp_usecount_dec_and_test (KDP's wrapped
-    #     credential refcounting) as a transitive symbol, and whatever
-    #     Module.symvers this build has access to doesn't carry a matching
-    #     CRC for it, so insmod rejects the whole module with "Unknown
-    #     symbol" for get_task_cred / __put_cred / kdp_usecount_dec_and_test
-    #     together. Confirmed via nm -u diff against the last known-good
-    #     (pre-patch) build that none of those three symbols were ever
-    #     referenced before this patch.
-    #
-    #     This is a safe removal, not a security-check weakening: the cred
-    #     fetch's only other effect is a NULL check that's realistically
-    #     unreachable (a live task_struct always has a valid cred), and
-    #     the one real call site (hdd_check_injection_capability(NULL),
-    #     confirmed via grep -- the only call site in the whole patch)
-    #     always passes NULL, meaning task is always `current` in
-    #     practice -- the exact same task capable() already checks.
-    #     Removing the dead fetch/release leaves capable(CAP_NET_RAW)
-    #     completely intact as the actual gate. ---
     f = HDD_SRC / "wlan_hdd_inject_security.c"
-
     inject_cap_old = (
         "\tconst struct cred *cred;\n"
         "\tbool has_capability = false;\n"
@@ -1121,11 +827,7 @@ def apply_hand_merges():
         "\n"
         "\t/* Check for CAP_NET_RAW capability */\n"
         "\thas_capability = capable(CAP_NET_RAW);\n"
-        "\t\n"  # confirmed via live CI (_diagnose()'s tab-visible dump): this
-                 # "blank" line carries a stray trailing tab in the real file,
-                 # unlike every other blank line in this function -- v12's
-                 # anchor assumed a true empty line here and missed by
-                 # exactly this one line.
+        "\t\n"
         "\tput_cred(cred);\n"
         "\n"
         "\tif (!has_capability) {\n"
@@ -1145,19 +847,13 @@ def apply_hand_merges():
         "\tif (!has_capability) {\n"
     )
     if already_present(f, inject_cap_new) and not already_present(f, "cred = get_task_cred(task);"):
-        print("[wlan_hdd_inject_security.c dead cred fetch] already removed "
-              "-- skipping")
+        print("[wlan_hdd_inject_security.c dead cred fetch] already removed -- skipping")
     else:
         fuzzy_replace(
             f, inject_cap_old, inject_cap_new,
             "wlan_hdd_inject_security.c remove dead get_task_cred/put_cred",
             diagnose_needle="QDF_STATUS hdd_check_injection_capability(struct task_struct *task)")
 
-    # --- Kbuild : wire the new object files + cppflag into the build.
-    #     Three separate insertion points, confirmed against real file
-    #     content (patch's own hunks reported "Reversed or previously
-    #     applied" against this tree, so its context can't be trusted --
-    #     these three anchors were pulled directly from the real file). ---
     f = QCACLD / "Kbuild"
     if already_present(f, "CONFIG_FEATURE_FRAME_INJECTION_SUPPORT), y)"):
         print("[Kbuild] already present -- skipping")
@@ -1207,25 +903,6 @@ def apply_hand_merges():
             "Kbuild cppflags",
             diagnose_needle="cppflags-y += -DDISABLE_MON_CONFIG")
 
-    # --- cfg80211.c : the patch adds its own simplified
-    #     wlan_hdd_cfg80211_get_channel(), which collides with this tree's
-    #     own, more complete SSR-safe wrapper (__wlan_hdd_cfg80211_get_channel
-    #     + osif_vdev_sync_op_start/stop pattern) of the same name. Confirmed
-    #     via a live compile error (redefinition). Identify the patch's
-    #     version by its distinctive docstring text (unique to this patch,
-    #     not generic CAF prose) rather than line numbers, since those drift.
-    #     .get_channel isn't on frame-injection's critical path (pure
-    #     userspace channel introspection), so deleting it outright is safe
-    #     -- no need to port its mon_chan_freq fallback into the real fn.
-    #
-    #     NOTE: after three rounds of a hand-transcribed full-body anchor
-    #     re-breaking on each newly-discovered internal divergence (first
-    #     the missing "Primary source"/"Fallback" comments, then another
-    #     mismatch further into the body that a 70-line diagnose window
-    #     couldn't even show), the literal-body approach was abandoned.
-    #     _delete_function_by_doc_marker() below finds this function
-    #     structurally -- by its doc comment, then brace-matching to the
-    #     closing '}' -- so it's correct no matter what the body contains. ---
     f = HDD_SRC / "wlan_hdd_cfg80211.c"
     patch_get_channel_marker = "so that tools like aireplay-ng / mdk3 can determine the current channel."
     if not already_present(f, patch_get_channel_marker):
@@ -1235,11 +912,6 @@ def apply_hand_merges():
             f, patch_get_channel_marker,
             "cfg80211.c remove duplicate get_channel")
 
-        # Drop one of the two identical .get_channel = ... designated
-        # initializers in wlan_hdd_cfg80211_ops (disambiguate via the
-        # unique neighboring .set_monitor_channel line; keep the
-        # unconditional one near .get_antenna so get_channel always works,
-        # not only when FEATURE_MONITOR_MODE_SUPPORT is on).
         fuzzy_replace(f,
             "#ifdef FEATURE_MONITOR_MODE_SUPPORT\n"
             "\t.set_monitor_channel = wlan_hdd_cfg80211_set_mon_ch,\n"
@@ -1251,7 +923,6 @@ def apply_hand_merges():
             "cfg80211.c remove duplicate .get_channel struct entry",
             diagnose_needle=".set_monitor_channel = wlan_hdd_cfg80211_set_mon_ch,")
 
-    # --- default_defconfig : enable the feature flag ---
     f = CONFIGS / "default_defconfig"
     fuzzy_replace(f,
         "CONFIG_FEATURE_MONITOR_MODE_SUPPORT := y\n",
@@ -1259,30 +930,6 @@ def apply_hand_merges():
         "CONFIG_FEATURE_FRAME_INJECTION_SUPPORT := y\n",
         "default_defconfig injection flag")
 
-    # --- qca_vendor.h : the patch's antenna-diversity-probe hunk landed in
-    #     entirely the wrong enum. Its context was only "RX_NSS = 78," +
-    #     blank line before the insertion, and the generic "/* keep last */"
-    #     / AFTER_LAST / MAX idiom after it -- and that idiom repeats
-    #     verbatim across dozens of unrelated enums in this header. Under
-    #     --fuzz=2, patch dropped the (now-distant, since this tree's
-    #     enum qca_wlan_vendor_attr_config has grown well past RX_NSS=78
-    #     since the patch's baseline) trailing-context requirement and
-    #     spliced the six new attrs into the next "keep last" block it
-    #     found instead: enum qca_wlan_vendor_attr_acs_offload, right
-    #     after QCA_WLAN_VENDOR_ATTR_ACS_EHT_ENABLED = 19. Confirmed via
-    #     direct file dump in CI. This silently bloats acs_offload's own
-    #     MAX from 19 to 129 (harmless by itself today, nothing reads
-    #     those indices there -- but wrong, and worth not leaving in
-    #     place) while leaving qca_wlan_vendor_attr_config's own MAX at
-    #     81, which is what wlan_hdd_cfg80211.c's designated initializers
-    #     for these same six attrs then fail to fit inside.
-    #     Fix: cut the six-entry block out of acs_offload's tail and
-    #     splice it into config's own tail instead, right after its real
-    #     last member (QCA_WLAN_VENDOR_ATTR_CONFIG_ARP_NS_OFFLOAD = 81)
-    #     and before ITS "/* keep last */". Each entry keeps its explicit
-    #     value (124-129), so only the two AFTER_LAST/MAX pairs move:
-    #     config's 82/81 -> 130/129 (matching every nla_parse() site that
-    #     already reads _CONFIG_MAX), acs_offload's back down to 20/19. ---
     f = WLAN_DIR / "qca-wifi-host-cmn/os_if/linux/qca_vendor.h"
     six_entries_block = (
         "\n"
@@ -1333,13 +980,9 @@ def apply_hand_merges():
         "\t * attribute specifies the number of WLAN probes.")
 
     if already_present(f, short_fixed_marker):
-        print("[qca_vendor.h ant_div relocation] already in the correct "
-              "enum (qca_wlan_vendor_attr_config) -- skipping")
+        print("[qca_vendor.h ant_div relocation] already in the correct enum -- skipping")
     elif not already_present(f, short_misplaced_marker):
-        msg = ("[qca_vendor.h ant_div relocation] six-entry block not found "
-               "at its known-wrong location (acs_offload's tail) and not "
-               "found at the correct location either -- tree has drifted "
-               "further than expected, needs a human to re-check")
+        msg = ("[qca_vendor.h ant_div relocation] six-entry block not found -- needs a human")
         FAILURES.append(msg)
         _diagnose(f, "QCA_WLAN_VENDOR_ATTR_CONFIG_ANT_DIV_PROBE_COUNT_WLAN")
     else:
@@ -1369,25 +1012,6 @@ def apply_hand_merges():
                 "qca_vendor.h insert ant_div block into qca_wlan_vendor_attr_config",
                 diagnose_needle="QCA_WLAN_VENDOR_ATTR_CONFIG_ARP_NS_OFFLOAD = 81,")
 
-    # --- tx_rx.c : radiotap include. The patch's own include-block hunk
-    #     (@@ -59,6 +59,9 @@, confirmed directly from the patch file) adds
-    #     the FEATURE_FRAME_INJECTION_SUPPORT guard for
-    #     wlan_hdd_frame_inject.h, but never adds an unconditional
-    #     #include <net/ieee80211_radiotap.h> anywhere. This tree already
-    #     has a conditional radiotap include further down:
-    #         #if defined(WLAN_SUPPORT_RX_FISA)
-    #         #include "dp_fisa_rx.h"
-    #         #else
-    #         #include <net/ieee80211_radiotap.h>
-    #         #endif
-    #     -- so in any build where WLAN_SUPPORT_RX_FISA is defined, that
-    #     #else branch is skipped and the injection code's use of struct
-    #     ieee80211_radiotap_header / ieee80211_get_radiotap_len() hits an
-    #     incomplete-type error (confirmed via live CI compile log). Add our
-    #     own unconditional include, guarded only by
-    #     FEATURE_FRAME_INJECTION_SUPPORT, right next to the include the
-    #     patch already added -- header guards make the (harmless) double
-    #     include under !WLAN_SUPPORT_RX_FISA builds a non-issue. ---
     f = HDD_SRC / "wlan_hdd_tx_rx.c"
     radiotap_include_tail = (
         '#include "wlan_hdd_frame_inject.h"\n'
@@ -1403,42 +1027,6 @@ def apply_hand_merges():
             "tx_rx.c radiotap include",
             diagnose_needle='#include "wlan_hdd_frame_inject.h"')
 
-    # --- tx_rx.c : __hdd_hard_start_xmit -- xmit probe log + injection
-    #     check landed in the wrong function. The patch's own hunk header
-    #     (@@ -959,6 +1110,27 @@ static void __hdd_hard_start_xmit(struct
-    #     sk_buff *skb), confirmed directly from the patch file) proves this
-    #     block was authored against __hdd_hard_start_xmit, where dev, skb,
-    #     and adapter (= WLAN_HDD_GET_PRIV_PTR(dev)) are all in scope. Under
-    #     --fuzz=2 it spliced instead into hdd_register_rx_ol_cb(struct
-    #     hdd_context *hdd_ctx, bool wifi3_0_target) -- both functions
-    #     happen to have "void *soc = cds_get_context(QDF_MODULE_ID_SOC);"
-    #     as a declaration line followed by a blank line, and that's all
-    #     the surviving context needed to match under heavy fuzz once the
-    #     real distance to the patch's original anchor grew too large.
-    #     Confirmed via live CI: 'use of undeclared identifier dev/adapter/
-    #     skb' at exactly the lines this block occupies inside
-    #     hdd_register_rx_ol_cb, which only takes (hdd_ctx, wifi3_0_target)
-    #     and never has dev/adapter/skb in scope at all.
-    #     Fix: cut the block out of hdd_register_rx_ol_cb and splice it
-    #     into __hdd_hard_start_xmit -- anchored on the END of the
-    #     function's declaration list (now "int cpu =
-    #     qdf_get_smp_processor_id();", the last declaration before
-    #     "#ifdef QCA_WIFI_FTM" in the current tree), not on an arbitrary
-    #     declaration line in the middle of the list. The patch's own hunk
-    #     context confirms this -- its post-context shows "#ifdef
-    #     QCA_WIFI_FTM" as the line immediately following the inserted
-    #     block in its original baseline, where "void *soc = ...;" WAS the
-    #     last declaration. This tree has since grown that declaration list
-    #     (subtype, is_eapol, is_dhcp, stats, cpu all came later), but the
-    #     adjacency to "#ifdef QCA_WIFI_FTM" is still the real anchor.
-    #     (An earlier version of this fix anchored on "void *soc = ...;"
-    #     instead and inserted a statement block ahead of later
-    #     declarations -- compiles clean with GCC by default but fails
-    #     under this kernel's -Wdeclaration-after-statement, confirmed via
-    #     live CI: "ISO C90 forbids mixing declarations and code" pointing
-    #     at the now-downstream "enum qdf_proto_subtype subtype = ...;".
-    #     Inserting after the LAST declaration avoids this categorically,
-    #     matching the patch's actual original intent.) ---
     xmit_probe_block = (
         "\tstatic bool xmit_probe_logged;\n"
         "\n"
@@ -1467,11 +1055,6 @@ def apply_hand_merges():
         + xmit_probe_block +
         "\n\tif  (!hdd_ctx) {\n"
     )
-    # Anchored on the END of __hdd_hard_start_xmit's declaration list (the
-    # last declaration, "int cpu = ...;", immediately followed by "#ifdef
-    # QCA_WIFI_FTM") -- see comment above for why, after the
-    # -Wdeclaration-after-statement failure on an earlier mid-declaration
-    # anchor.
     xmit_probe_decl_end = "\tint cpu = qdf_get_smp_processor_id();\n"
     xmit_probe_ftm_guard = "\n#ifdef QCA_WIFI_FTM\n"
     xmit_probe_fixed_marker = (
@@ -1479,13 +1062,9 @@ def apply_hand_merges():
     )
 
     if already_present(f, xmit_probe_fixed_marker):
-        print("[tx_rx.c xmit_probe relocation] already in "
-              "__hdd_hard_start_xmit -- skipping")
+        print("[tx_rx.c xmit_probe relocation] already in __hdd_hard_start_xmit -- skipping")
     elif not already_present(f, xmit_probe_misplaced_marker):
-        msg = ("[tx_rx.c xmit_probe relocation] block not found at its "
-               "known-wrong location (hdd_register_rx_ol_cb) and not found "
-               "at the correct location either -- tree has drifted further "
-               "than expected, needs a human to re-check")
+        msg = ("[tx_rx.c xmit_probe relocation] block not found -- needs a human")
         FAILURES.append(msg)
         _diagnose(f, "xmit_probe_logged")
     else:
@@ -1501,14 +1080,9 @@ def apply_hand_merges():
                 f,
                 xmit_probe_decl_end + xmit_probe_ftm_guard,
                 xmit_probe_fixed_marker,
-                "tx_rx.c insert xmit_probe block into __hdd_hard_start_xmit "
-                "(after last declaration, before first statement)",
+                "tx_rx.c insert xmit_probe block into __hdd_hard_start_xmit",
                 diagnose_needle="int cpu = qdf_get_smp_processor_id();")
 
-    # --- tx_rx.c : wlan_hdd_netif_queue_control -- monitor-interface
-    #     carrier/queue debug guard, after this tree's extra MLO
-    #     hdd_adapter_is_link_adapter() guard ---
-    f = HDD_SRC / "wlan_hdd_tx_rx.c"
     fuzzy_replace(f,
         "\tuint32_t temp_map;\n\tuint8_t index;\n"
         "\tstruct hdd_netif_queue_history *txq_hist_ptr;\n\n"
@@ -1535,37 +1109,6 @@ def apply_hand_merges():
         "\t\t\t    adapter->pause_map, current->comm);\n\t}\n\n\tswitch (action) {",
         "tx_rx.c netif_queue_control monitor guard")
 
-    # --- wlan_hdd_main.h : hdd_adapter struct -- new dedicated atomic
-    #     field for serializing monitor-mode channel switches.
-    #
-    #     Ground truth: live CI dump (cat -A) of lines 1415-1435 of the
-    #     user's actual tree confirms this exact two-line adjacency
-    #     (qdf_atomic_t ch_switch_in_progress; immediately followed by
-    #     qdf_event_t acs_complete_event;) inside struct hdd_adapter.
-    #     Full-tree grep (20k-line dump) confirms "mon_ch_switch_in_progress"
-    #     does not already exist anywhere -- no name collision.
-    #
-    #     Not reusing the existing ch_switch_in_progress field: grep of
-    #     every read/write site (wlan_hdd_main.c:3879,
-    #     wlan_hdd_hostapd.c:2018/2212/2901/2905/3237/3245/3271/3283/3295/
-    #     3320/4079/4080/4177, wlan_hdd_sap_cond_chan_switch.c:273)
-    #     confirms it is used exclusively by the SAP/GO channel-switch
-    #     path -- reusing it for monitor mode would cross-wire two
-    #     unrelated state machines on one counter.
-    #
-    #     NOTE (flagged, not silently assumed): the SAP field has an
-    #     explicit qdf_atomic_init(&adapter->ch_switch_in_progress) call
-    #     in its SAP-only adapter-open path (wlan_hdd_hostapd.c:4177).
-    #     There is no equivalent monitor-mode-specific adapter-open
-    #     anchor in hand for this field yet, so it is left relying on
-    #     the struct's normal zero-initialization (alloc_netdev() zeroes
-    #     the netdev private area, same as every other un-initialized
-    #     qdf_atomic_t/bool field already in this struct) rather than
-    #     adding an explicit init call against a guessed anchor. If a
-    #     future debug dump shows this assumption is wrong (e.g. adapter
-    #     reuse without re-zeroing), send the real monitor-mode
-    #     adapter-open function and an explicit qdf_atomic_init() can be
-    #     added precisely. ---
     f = HDD_INC / "wlan_hdd_main.h"
     fuzzy_replace(
         f,
@@ -1577,69 +1120,7 @@ def apply_hand_merges():
         "main.h mon_ch_switch_in_progress field",
         diagnose_needle="qdf_atomic_t ch_switch_in_progress;")
 
-    # --- wlan_hdd_cfg80211.c : __wlan_hdd_cfg80211_set_mon_ch -- fix for
-    #     the kernel panic / stuck-driver-needs-reload bug during rapid
-    #     monitor-mode channel hops (airodump-ng-style scanning), worse
-    #     when a real scan races a hop.
-    #
-    #     Root cause (confirmed via live CI cat -A dump of the user's
-    #     actual tree, lines 22814-22990, this entire function):
-    #       1. wlan_hdd_change_hw_mode_for_given_chnl() is called on
-    #          EVERY channel hop, unconditionally, even once hw mode is
-    #          already settled into DBS. It waits on
-    #          policy_mgr_wait_for_connection_update(), which blocks on
-    #          a single SHARED, psoc-wide connection_update_done_evt --
-    #          not per-request. Rapid hops (or a real scan, which drives
-    #          the same policy_mgr_current_connections_update() via
-    #          csr_api_scan.c) can race resetting/waiting on that one
-    #          event. This call is completely UNGUARDED -- nothing
-    #          serializes overlapping entries into this function at all.
-    #       2. The second half of the function (sme_roam_channel_change_req
-    #          + blocking wait on qdf_monitor_mode_vdev_up_event) is only
-    #          partially guarded by adapter->monitor_mode_vdev_up_in_progress
-    #          -- a plain bool, checked once (line ~22908) and set true
-    #          several lines later (line ~22918), a TOCTOU gap, and it
-    #          doesn't cover the hw-mode call above it at all.
-    #
-    #     Validated against two independent real references (user
-    #     explicitly directed this investigation, approved the fix
-    #     direction below over a bigger rewrite):
-    #       - ath11k (mainline, same Qualcomm chip family, different
-    #         driver model): direct restart-flag vdev command, everything
-    #         serialized under one ar->conf_mutex -- confirms "serialize
-    #         the whole retune" is the sound design, used here only as
-    #         architectural validation (ath11k is mac80211/soft-mac,
-    #         this driver is full-mac/offload -- no code is ported).
-    #       - This driver's own SAP/GO channel-switch path (the authentic
-    #         in-architecture reference):
-    #           * policy_mgr_check_and_set_hw_mode_for_channel_switch()
-    #             (wlan_policy_mgr_action.c) already has the
-    #             "if (policy_mgr_is_current_hwmode_dbs(psoc)) return
-    #             QDF_STATUS_E_ALREADY" short-circuit monitor mode is
-    #             missing -- applied below.
-    #           * hdd_softap_set_channel_change() (wlan_hdd_hostapd.c)
-    #             guards its entire switch with
-    #             qdf_atomic_inc_return(&adapter->ch_switch_in_progress)
-    #             > 1, released via qdf_atomic_set(..., 0) on every exit
-    #             path (confirmed by reading every one of its ~10 call
-    #             sites) -- the same inc_return>1 / set(...,0) idiom is
-    #             mirrored below on the new mon_ch_switch_in_progress
-    #             field, covering the ENTIRE sequence (hw-mode call
-    #             through vdev-up), not just the back half.
-    #
-    #     This is the conservative fix the user explicitly chose over a
-    #     bigger rewrite that would bypass the roam/vdev-rebuild
-    #     mechanism entirely ("I think we go for that easier road for
-    #     now and see how it will work out if it doesn't work well we
-    #     switch to bigger one"). Purely additive: every existing
-    #     monitor_mode_vdev_up_in_progress assignment and check is left
-    #     untouched (something else in the tree may read that flag for
-    #     an unrelated purpose), this just adds a new outer layer that
-    #     actually closes the race. ---
     f = HDD_SRC / "wlan_hdd_cfg80211.c"
-
-    # Hunk 1: acquire the new guard + skip redundant hw-mode renegotiation
-    # when already in DBS mode (the actual anchor for the race).
     fuzzy_replace(
         f,
         "\tch_params.ch_width = ch_width;\n"
@@ -1673,8 +1154,6 @@ def apply_hand_merges():
         "cfg80211.c set_mon_ch: acquire guard + DBS skip-check",
         diagnose_needle="if (wlan_hdd_change_hw_mode_for_given_chnl(adapter,")
 
-    # Hunk 2: release the guard on the pre-existing busy check (left
-    # exactly as-is otherwise -- see comment above on why it's not removed).
     fuzzy_replace(
         f,
         "\tif (adapter->monitor_mode_vdev_up_in_progress) {\n"
@@ -1689,7 +1168,6 @@ def apply_hand_merges():
         "cfg80211.c set_mon_ch: release guard on vdev-up-in-progress return",
         diagnose_needle="monitor mode vdev up in progress")
 
-    # Hunk 3: release the guard on qdf_event_reset() failure.
     fuzzy_replace(
         f,
         "\tstatus = qdf_event_reset(&adapter->qdf_monitor_mode_vdev_up_event);\n"
@@ -1706,7 +1184,6 @@ def apply_hand_merges():
         "cfg80211.c set_mon_ch: release guard on event-reset failure",
         diagnose_needle="failed to reinit monitor mode vdev up event")
 
-    # Hunk 4: release the guard on sme_roam_channel_change_req() failure.
     fuzzy_replace(
         f,
         "\tstatus = sme_roam_channel_change_req(mac_handle, bssid,\n"
@@ -1735,8 +1212,6 @@ def apply_hand_merges():
         "cfg80211.c set_mon_ch: release guard on roam-channel-change failure",
         diagnose_needle="Failed to set sme_RoamChannel for monitor mode")
 
-    # Hunk 5: release the guard on the vdev-up wait timeout AND on the
-    # success path (the function's two remaining exits).
     fuzzy_replace(
         f,
         "\t\telse\n"
@@ -1775,66 +1250,6 @@ def apply_hand_merges():
         "cfg80211.c set_mon_ch: release guard on timeout + success paths",
         diagnose_needle="Failed monitor mode vdev up(status-%d)")
 
-    # --- wma_frame_inject.c : wma_injection_ensure_tx_vdev() -- stop
-    #     rebuilding the hidden injection TX vdev on every channel hop.
-    #
-    #     This is a fix to the injection PATCH's own code, not to drifted
-    #     stock driver code -- wma_frame_inject.c is a brand-new file the
-    #     patch creates outright (+++ b/.../wma_frame_inject.c from
-    #     /dev/null), so this anchor is taken verbatim from the patch
-    #     file itself (patches/07_packet_injection.patch), not from a
-    #     live CI dump -- there is no drift risk for a file that didn't
-    #     exist before the patch created it.
-    #
-    #     Root cause (confirmed via live device dmesg: a 24s stall that
-    #     self-recovered, then a real kernel Oops in
-    #     wma_send_injection_frame_to_fw while CNSS_FW_RECOVERY was
-    #     active, captured together with a sysrq "show blocked state"
-    #     dump on 2026-10-27): firmware rejects mgmt-TX on a MONITOR
-    #     vdev, so the patch routes injected frames through a second,
-    #     hidden fake-STA vdev instead (g_inj_tx_vdev). The bug is that
-    #     wma_injection_ensure_tx_vdev() tore this hidden vdev down and
-    #     rebuilt it from scratch -- 6 separate WMI commands
-    #     (peer-delete/vdev-stop/vdev-delete, then
-    #     vdev-create/vdev-start/peer-create), each followed by a blind
-    #     msleep(100-150) with NO verification firmware actually
-    #     finished the step -- every single time the channel changed.
-    #     That is ~400-700ms of synchronous blocking sleep, run inside
-    #     the SAME injection workqueue that is supposed to be draining
-    #     queued frames, on every channel hop. Channel-hop fast (as
-    #     airodump-ng does) and the worker falls behind, frames back up
-    #     in the queue (matches the user's own description: "something
-    #     keep pile up till it froze"), and the unsynchronized
-    #     destroy+recreate churn (g_inj_tx_vdev is a bare global, no
-    #     lock anywhere) is a plausible driver of the firmware crash
-    #     (CNSS_FW_RECOVERY) and the subsequent Oops.
-    #
-    #     Why it's safe to stop doing this on a same-band channel
-    #     change: every injected frame already carries its own real
-    #     target channel in the per-command WMI chanfreq field, read
-    #     LIVE from the monitor vdev's current channel right before
-    #     each send (tx_chanfreq in wma_send_injection_frame_to_fw(),
-    #     confirmed: `if (wma_handle->interfaces[vdev_id].mhz)
-    #     tx_chanfreq = wma_handle->interfaces[vdev_id].mhz;` then
-    #     `mgmt_params.chanfreq = ... tx_chanfreq`). This is the EXACT
-    #     mechanism the stock, unrelated P2P off-channel action-frame TX
-    #     path already relies on (p2p_mgmt_tx(), confirmed in the live
-    #     tree: sets mgmt_param.chanfreq to the target channel and sends
-    #     via the same wmi_mgmt_unified_cmd_send-family API, with ZERO
-    #     vdev reconfiguration). The hidden vdev's own "started" channel
-    #     is only ever used again by this one created/chanfreq
-    #     comparison -- nothing downstream reads it for per-frame TX.
-    #
-    #     What's kept, deliberately conservative: a BAND change (2.4GHz
-    #     <-> 5GHz) still triggers the full teardown+recreate, since the
-    #     hidden vdev's phy_mode (11G vs 11A) is set once at creation
-    #     from the initial channel and there is no in-tree evidence
-    #     either way on whether firmware requires that to track the
-    #     actual band of travel for an off-channel TX. Band changes are
-    #     far less frequent than every single hop (a scan sweep is
-    #     mostly one band at a time), so this keeps almost all the
-    #     benefit while hedging the one thing not confirmed from code
-    #     alone. ---
     f = WMA_SRC / "wma_frame_inject.c"
     fuzzy_replace(
         f,
@@ -1867,83 +1282,9 @@ def apply_hand_merges():
         "wma_frame_inject.c ensure_tx_vdev: only recreate on band change",
         diagnose_needle="g_inj_tx_vdev.created) {")
 
-    # --- wma_frame_inject.c : wma_injection_ensure_tx_vdev() never brings
-    #     the hidden injection TX vdev UP -- it is created, started, given
-    #     a self-peer, then the patch's own comment says "Skip VDEV_UP...
-    #     firmware's wlan_vdev_up asserts unless a BSS peer (the AP)
-    #     exists". That claim is not backed by this tree's own code:
-    #
-    #     Confirmed via live on-device dmesg (2026-10-27,
-    #     c718575a-wlan_test_full.log): with v16 applied (no crash, no
-    #     hang, HDD queue draining fine, 11 real injected frames reaching
-    #     wma_send_injection_frame_to_fw and wmi_mgmt_unified_cmd_send),
-    #     EVERY SINGLE completion came back
-    #     status=DISCARDED(WMI_MGMT_TX_COMP_TYPE_DISCARD) --
-    #     wma_handle_injection_fw_response's own status-decode switch.
-    #     Zero OK, zero NO_ACK, zero anything else. This is the real
-    #     mechanism behind "frames send without doing anything": the
-    #     driver thinks it succeeded (hdd_monitor_mode_tx_inject() always
-    #     kfree_skb()s and reports success to userspace regardless), but
-    #     firmware throws every frame away.
-    #
-    #     Confirmed via a targeted CI debug dump of the real, stock,
-    #     pre-patch qca-wifi-host-cmn tree (same day) that a vdev left
-    #     STARTED-but-never-UP is very plausibly exactly why: this
-    #     exact driver already proves VDEV_UP does not require a real
-    #     BSS peer for a vdev with no AP relationship --
-    #     wma_mon_mlme_vdev_up_send() (which brings up the REAL monitor
-    #     vdev this phone already uses successfully for scanning right
-    #     now) calls vdev_mgr_up_send() with assoc_id forced to 0, no
-    #     peer check anywhere in that path. The driver also has a
-    #     dedicated OCB vdev type (frame TX with no AP association at
-    #     all -- 802.11p/V2V) that reaches the identical
-    #     vdev_mgr_up_send() call directly off the generic
-    #     vdev-start-response handler, again with no BSS-peer
-    #     requirement (wma_dev_if.c, WMI_VDEV_TYPE_OCB branch). And the
-    #     low-level function this fix actually calls --
-    #     send_vdev_up_cmd_tlv() in wmi/src/wmi_unified_tlv.c, the real
-    #     implementation behind wmi_unified_vdev_up_send() -- has ZERO
-    #     peer-existence check, ZERO assert, ZERO BUG_ON: it
-    #     unconditionally builds wmi_vdev_up_cmd_fixed_param (vdev_id,
-    #     vdev_assoc_id, profile_idx/profile_num, trans_bssid, and the
-    #     bssid argument into cmd->vdev_bssid) and sends
-    #     WMI_VDEV_UP_CMDID. It is the exact same call level as the
-    #     vdev-create/vdev-start/peer-create calls this function already
-    #     makes directly (wmi_handle + a flat params struct, no
-    #     wlan_objmgr_vdev / vdev_mlme_obj needed) -- so it was never
-    #     actually blocked by a "needs a real peer object" requirement.
-    #     The one QDF_BUG(0) found near vdev-up handling in this tree
-    #     (vdev_mlme_sm.c) is an unrelated state-machine fallthrough
-    #     case, not a peer check -- consistent with someone having tried
-    #     the OTHER, SM-driven vdev_mgr_up_send(mlme_obj) path (which
-    #     this ad-hoc raw-WMI helper vdev was never properly registered
-    #     into) and hit that instead, then concluded VDEV_UP itself was
-    #     unsafe.
-    #
-    #     bssid is set to the helper vdev's own MAC (inj_mac) -- there is
-    #     no real AP, so "self-BSS" is the only meaningful choice, same
-    #     as how this vdev already identifies itself for vdev-create and
-    #     peer-create. assoc_id is 0, mirroring
-    #     wma_mon_mlme_vdev_up_send()'s identical no-real-association
-    #     case exactly.
-    #
-    #     Not independently re-verified: whether struct vdev_up_params is
-    #     already visible in this file without a new #include. It is
-    #     defined in the SAME header
-    #     (wlan_vdev_mgr_tgt_if_tx_defs.h) as vdev_start_params /
-    #     vdev_create_params / peer_create_params, which this exact
-    #     function already uses successfully (confirmed by v15/v16
-    #     compiling and running), so it is very likely already in scope
-    #     -- but this is an inference, not a direct grep hit on an
-    #     #include line in this file, and should be treated as the first
-    #     thing to check if the next build fails here (a one-line
-    #     #include fix, not a behavioral question).
-    f = WMA_SRC / "wma_frame_inject.c"
-
     vdev_up_marker = "status = wmi_unified_vdev_up_send(wma->wmi_handle, inj_mac,"
     if already_present(f, vdev_up_marker):
-        print("[wma_frame_inject.c ensure_tx_vdev: VDEV_UP] already present "
-              "-- skipping")
+        print("[wma_frame_inject.c ensure_tx_vdev: VDEV_UP] already present -- skipping")
     else:
         fuzzy_replace(
             f,
@@ -1956,12 +1297,38 @@ def apply_hand_merges():
             "\n"
             "\tg_inj_tx_vdev.created          = true;\n",
             "\t{\n"
-            "\t\tstruct vdev_up_params vup;\n"
+            "\t\tQDF_STATUS status;\n"
             "\n"
-            "\t\tqdf_mem_zero(&vup, sizeof(vup));\n"
-            "\t\tvup.vdev_id = vid;\n"
             "\t\t/*\n"
             "\t\t * No real AP association exists for this self-peer-only\n"
             "\t\t * helper vdev, so there is no AID.\n"
             "\t\t * wma_mon_mlme_vdev_up_send() -- which brings up the\n"
-            "\t\t * real monitor vdev successfully on this exact hardwa
+            "\t\t * real monitor vdev successfully on this exact hardware\n"
+            "\t\t * right now -- calls vdev_mgr_up_send() with assoc_id\n"
+            "\t\t * forced to 0, no peer check anywhere in that path.\n"
+            "\t\t */\n"
+            "\t\tstatus = wmi_unified_vdev_up_send(wma->wmi_handle, inj_mac,\n"
+            "\t\t\t\t\t\t\t\t  vid, 0, 0);\n"
+            "\t\tif (QDF_IS_STATUS_ERROR(status)) {\n"
+            "\t\t\tWMA_LOGE(\"%s: Failed to send VDEV_UP for injection vdev: %d\",\n"
+            "\t\t\t\t __func__, status);\n"
+            "\t\t}\n"
+            "\t}\n"
+            "\n"
+            "\tg_inj_tx_vdev.created = true;\n",
+            "wma_frame_inject.c ensure_tx_vdev: send VDEV_UP",
+            diagnose_needle="Skip VDEV_UP."
+        )
+
+
+if __name__ == "__main__":
+    run_bulk_patch()
+    apply_hand_merges()
+    scan_for_duplicate_functions()
+    dump_rejects()
+    if FAILURES:
+        print(f"\n{'=' * 60}\nFATAL: {len(FAILURES)} hand-merge/validation failure(s):\n{'=' * 60}")
+        for msg in FAILURES:
+            print(f"  - {msg}")
+        sys.exit(1)
+    print(f"\n{'=' * 60}\nSUCCESS: All patches and hand-merges applied cleanly!\n{'=' * 60}")

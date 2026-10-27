@@ -1775,6 +1775,98 @@ def apply_hand_merges():
         "cfg80211.c set_mon_ch: release guard on timeout + success paths",
         diagnose_needle="Failed monitor mode vdev up(status-%d)")
 
+    # --- wma_frame_inject.c : wma_injection_ensure_tx_vdev() -- stop
+    #     rebuilding the hidden injection TX vdev on every channel hop.
+    #
+    #     This is a fix to the injection PATCH's own code, not to drifted
+    #     stock driver code -- wma_frame_inject.c is a brand-new file the
+    #     patch creates outright (+++ b/.../wma_frame_inject.c from
+    #     /dev/null), so this anchor is taken verbatim from the patch
+    #     file itself (patches/07_packet_injection.patch), not from a
+    #     live CI dump -- there is no drift risk for a file that didn't
+    #     exist before the patch created it.
+    #
+    #     Root cause (confirmed via live device dmesg: a 24s stall that
+    #     self-recovered, then a real kernel Oops in
+    #     wma_send_injection_frame_to_fw while CNSS_FW_RECOVERY was
+    #     active, captured together with a sysrq "show blocked state"
+    #     dump on 2026-10-27): firmware rejects mgmt-TX on a MONITOR
+    #     vdev, so the patch routes injected frames through a second,
+    #     hidden fake-STA vdev instead (g_inj_tx_vdev). The bug is that
+    #     wma_injection_ensure_tx_vdev() tore this hidden vdev down and
+    #     rebuilt it from scratch -- 6 separate WMI commands
+    #     (peer-delete/vdev-stop/vdev-delete, then
+    #     vdev-create/vdev-start/peer-create), each followed by a blind
+    #     msleep(100-150) with NO verification firmware actually
+    #     finished the step -- every single time the channel changed.
+    #     That is ~400-700ms of synchronous blocking sleep, run inside
+    #     the SAME injection workqueue that is supposed to be draining
+    #     queued frames, on every channel hop. Channel-hop fast (as
+    #     airodump-ng does) and the worker falls behind, frames back up
+    #     in the queue (matches the user's own description: "something
+    #     keep pile up till it froze"), and the unsynchronized
+    #     destroy+recreate churn (g_inj_tx_vdev is a bare global, no
+    #     lock anywhere) is a plausible driver of the firmware crash
+    #     (CNSS_FW_RECOVERY) and the subsequent Oops.
+    #
+    #     Why it's safe to stop doing this on a same-band channel
+    #     change: every injected frame already carries its own real
+    #     target channel in the per-command WMI chanfreq field, read
+    #     LIVE from the monitor vdev's current channel right before
+    #     each send (tx_chanfreq in wma_send_injection_frame_to_fw(),
+    #     confirmed: `if (wma_handle->interfaces[vdev_id].mhz)
+    #     tx_chanfreq = wma_handle->interfaces[vdev_id].mhz;` then
+    #     `mgmt_params.chanfreq = ... tx_chanfreq`). This is the EXACT
+    #     mechanism the stock, unrelated P2P off-channel action-frame TX
+    #     path already relies on (p2p_mgmt_tx(), confirmed in the live
+    #     tree: sets mgmt_param.chanfreq to the target channel and sends
+    #     via the same wmi_mgmt_unified_cmd_send-family API, with ZERO
+    #     vdev reconfiguration). The hidden vdev's own "started" channel
+    #     is only ever used again by this one created/chanfreq
+    #     comparison -- nothing downstream reads it for per-frame TX.
+    #
+    #     What's kept, deliberately conservative: a BAND change (2.4GHz
+    #     <-> 5GHz) still triggers the full teardown+recreate, since the
+    #     hidden vdev's phy_mode (11G vs 11A) is set once at creation
+    #     from the initial channel and there is no in-tree evidence
+    #     either way on whether firmware requires that to track the
+    #     actual band of travel for an off-channel TX. Band changes are
+    #     far less frequent than every single hop (a scan sweep is
+    #     mostly one band at a time), so this keeps almost all the
+    #     benefit while hedging the one thing not confirmed from code
+    #     alone. ---
+    f = WMA_SRC / "wma_frame_inject.c"
+    fuzzy_replace(
+        f,
+        "\tif (g_inj_tx_vdev.created) {\n"
+        "\t\tif (g_inj_tx_vdev.chanfreq == chanfreq)\n"
+        "\t\t\treturn QDF_STATUS_SUCCESS;\n"
+        "\t\t/* Channel changed – tear down and recreate */\n"
+        "\t\twma_injection_destroy_tx_vdev(wma);\n"
+        "\t}\n",
+        "\tif (g_inj_tx_vdev.created) {\n"
+        "\t\tif ((g_inj_tx_vdev.chanfreq < 4000) == (chanfreq < 4000))\n"
+        "\t\t\treturn QDF_STATUS_SUCCESS;\n"
+        "\t\t/*\n"
+        "\t\t * Only recreate on an actual BAND change (2.4GHz <-> 5GHz),\n"
+        "\t\t * not on every same-band channel change -- every injected\n"
+        "\t\t * frame already carries its own real target channel in the\n"
+        "\t\t * per-command WMI chanfreq field (read live from the\n"
+        "\t\t * monitor vdev's current channel right before this call,\n"
+        "\t\t * see tx_chanfreq in wma_send_injection_frame_to_fw()),\n"
+        "\t\t * the same mechanism the stock P2P off-channel\n"
+        "\t\t * action-frame path (p2p_mgmt_tx()) already relies on to\n"
+        "\t\t * transmit on a channel different from the sending vdev's\n"
+        "\t\t * own channel, with zero vdev reconfiguration. Recreating\n"
+        "\t\t * this vdev on every hop bought nothing but ~400-700ms of\n"
+        "\t\t * synchronous msleep() per hop inside the injection\n"
+        "\t\t * workqueue.\n"
+        "\t\t */\n"
+        "\t\twma_injection_destroy_tx_vdev(wma);\n"
+        "\t}\n",
+        "wma_frame_inject.c ensure_tx_vdev: only recreate on band change",
+        diagnose_needle="g_inj_tx_vdev.created) {")
+
 
 def check_unaddressed_rejects():
     """Flag any .rej that looks unaddressed in the final tree.

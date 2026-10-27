@@ -75,6 +75,80 @@ jobs:
           test -d vendor/qcom/opensource/wlan/qcacld-3.0
           test -d vendor/qcom/opensource/wlan/qca-wifi-host-cmn
 
+      - name: DEBUG dump vdev_up ground truth (stock tree, pre-patch)
+        run: |
+          set +e
+          OUT="$GITHUB_WORKSPACE/debug_vdev_up_dump.log"
+          : > "$OUT"
+          CLD=vendor/qcom/opensource/wlan/qcacld-3.0
+          CMN=vendor/qcom/opensource/wlan/qca-wifi-host-cmn
+
+          echo "=== struct vdev_up_params definition ===" >> "$OUT"
+          grep -rn "struct vdev_up_params" "$CMN" --include=*.h -A 25 >> "$OUT" 2>&1
+
+          echo >> "$OUT"
+          echo "=== wmi_unified_vdev_up_send() decl + call sites ===" >> "$OUT"
+          grep -rn "wmi_unified_vdev_up_send" "$CMN" "$CLD" >> "$OUT" 2>&1
+
+          echo >> "$OUT"
+          echo "=== send_vdev_up_cmd_tlv implementation (file + function body) ===" >> "$OUT"
+          F=$(grep -rl "send_vdev_up_cmd_tlv" "$CMN" --include=*.c | head -1)
+          echo "found in: $F" >> "$OUT"
+          if [ -n "$F" ]; then
+            awk '
+              /send_vdev_up_cmd_tlv\(/ { flag=1; depth=0 }
+              flag {
+                print
+                depth += gsub(/{/, "{")
+                depth -= gsub(/}/, "}")
+                if (depth <= 0 && /}/ && NR > 1 && started) exit
+                if (/{/) started=1
+              }
+            ' "$F" >> "$OUT" 2>&1
+          fi
+
+          echo >> "$OUT"
+          echo "=== vdev_mgr_up_send() implementation (target_if layer) ===" >> "$OUT"
+          F2=$(grep -rl "^QDF_STATUS vdev_mgr_up_send\|^vdev_mgr_up_send" "$CMN" --include=*.c | head -1)
+          echo "found in: $F2" >> "$OUT"
+          if [ -n "$F2" ]; then
+            awk '
+              /vdev_mgr_up_send\(struct vdev_mlme_obj/ { flag=1; depth=0; started=0 }
+              flag {
+                print
+                depth += gsub(/{/, "{")
+                depth -= gsub(/}/, "}")
+                if (/{/) started=1
+                if (depth <= 0 && started) exit
+              }
+            ' "$F2" >> "$OUT" 2>&1
+          fi
+
+          echo >> "$OUT"
+          echo "=== BUG_ON / QDF_BUG / assert near vdev up + peer (host-side) ===" >> "$OUT"
+          grep -rn -i -B3 -A3 "vdev_up\|VDEV_UP" "$CMN" --include=*.c 2>/dev/null | grep -i -B3 -A3 "BUG_ON\|QDF_BUG\|qdf_assert" >> "$OUT" 2>&1
+
+          echo >> "$OUT"
+          echo "=== OCB vdev type: config/up requirements in qcacld-3.0 ===" >> "$OUT"
+          grep -rn "ucfg_ocb_config_channel\|WMI_VDEV_TYPE_OCB" "$CLD" --include=*.c -n | head -60 >> "$OUT" 2>&1
+
+          echo >> "$OUT"
+          echo "=== any explicit vdev 'is_up'/active check gating mgmt tx / WMI_MGMT_TX_COMP ===" >> "$OUT"
+          grep -rln "WMI_MGMT_TX_COMP_TYPE_DISCARD\|wmi_mgmt_unified_cmd_send" "$CMN" --include=*.c >> "$OUT" 2>&1
+          echo "--- is_up/active checks near mgmt tx send ---" >> "$OUT"
+          grep -rn -B5 -A5 "wmi_mgmt_unified_cmd_send" "$CMN" --include=*.c 2>/dev/null | grep -i -B5 -A5 "is_up\|vdev_up\|active" >> "$OUT" 2>&1
+
+          wc -l "$OUT"
+          exit 0
+
+      - name: Upload vdev_up debug dump
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vdev-up-debug-dump
+          path: debug_vdev_up_dump.log
+          if-no-files-found: ignore
+
       - name: Apply packet injection patch + tree-specific fixups
         run: |
           python3 patches/apply_injection_patch.py
@@ -87,10 +161,11 @@ jobs:
           path: injection_patch_report.log
           if-no-files-found: ignore
 
-      - name: DEBUG dump end of __wlan_hdd_cfg80211_set_mon_ch
+      - name: DEBUG dump frame_inject.h vendor commands macro
         run: |
           set +e
-          sed -n '22954,22990p' vendor/qcom/opensource/wlan/qcacld-3.0/core/hdd/src/wlan_hdd_cfg80211.c | cat -A
+          grep -n "define FEATURE_FRAME_INJECTION_VENDOR_COMMANDS" -A 24 \
+            vendor/qcom/opensource/wlan/qcacld-3.0/core/hdd/inc/wlan_hdd_frame_inject.h | cat -A
           exit 0
 
       - name: Prepare kernel headers for external module

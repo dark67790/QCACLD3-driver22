@@ -1867,125 +1867,101 @@ def apply_hand_merges():
         "wma_frame_inject.c ensure_tx_vdev: only recreate on band change",
         diagnose_needle="g_inj_tx_vdev.created) {")
 
+    # --- wma_frame_inject.c : wma_injection_ensure_tx_vdev() never brings
+    #     the hidden injection TX vdev UP -- it is created, started, given
+    #     a self-peer, then the patch's own comment says "Skip VDEV_UP...
+    #     firmware's wlan_vdev_up asserts unless a BSS peer (the AP)
+    #     exists". That claim is not backed by this tree's own code:
+    #
+    #     Confirmed via live on-device dmesg (2026-10-27,
+    #     c718575a-wlan_test_full.log): with v16 applied (no crash, no
+    #     hang, HDD queue draining fine, 11 real injected frames reaching
+    #     wma_send_injection_frame_to_fw and wmi_mgmt_unified_cmd_send),
+    #     EVERY SINGLE completion came back
+    #     status=DISCARDED(WMI_MGMT_TX_COMP_TYPE_DISCARD) --
+    #     wma_handle_injection_fw_response's own status-decode switch.
+    #     Zero OK, zero NO_ACK, zero anything else. This is the real
+    #     mechanism behind "frames send without doing anything": the
+    #     driver thinks it succeeded (hdd_monitor_mode_tx_inject() always
+    #     kfree_skb()s and reports success to userspace regardless), but
+    #     firmware throws every frame away.
+    #
+    #     Confirmed via a targeted CI debug dump of the real, stock,
+    #     pre-patch qca-wifi-host-cmn tree (same day) that a vdev left
+    #     STARTED-but-never-UP is very plausibly exactly why: this
+    #     exact driver already proves VDEV_UP does not require a real
+    #     BSS peer for a vdev with no AP relationship --
+    #     wma_mon_mlme_vdev_up_send() (which brings up the REAL monitor
+    #     vdev this phone already uses successfully for scanning right
+    #     now) calls vdev_mgr_up_send() with assoc_id forced to 0, no
+    #     peer check anywhere in that path. The driver also has a
+    #     dedicated OCB vdev type (frame TX with no AP association at
+    #     all -- 802.11p/V2V) that reaches the identical
+    #     vdev_mgr_up_send() call directly off the generic
+    #     vdev-start-response handler, again with no BSS-peer
+    #     requirement (wma_dev_if.c, WMI_VDEV_TYPE_OCB branch). And the
+    #     low-level function this fix actually calls --
+    #     send_vdev_up_cmd_tlv() in wmi/src/wmi_unified_tlv.c, the real
+    #     implementation behind wmi_unified_vdev_up_send() -- has ZERO
+    #     peer-existence check, ZERO assert, ZERO BUG_ON: it
+    #     unconditionally builds wmi_vdev_up_cmd_fixed_param (vdev_id,
+    #     vdev_assoc_id, profile_idx/profile_num, trans_bssid, and the
+    #     bssid argument into cmd->vdev_bssid) and sends
+    #     WMI_VDEV_UP_CMDID. It is the exact same call level as the
+    #     vdev-create/vdev-start/peer-create calls this function already
+    #     makes directly (wmi_handle + a flat params struct, no
+    #     wlan_objmgr_vdev / vdev_mlme_obj needed) -- so it was never
+    #     actually blocked by a "needs a real peer object" requirement.
+    #     The one QDF_BUG(0) found near vdev-up handling in this tree
+    #     (vdev_mlme_sm.c) is an unrelated state-machine fallthrough
+    #     case, not a peer check -- consistent with someone having tried
+    #     the OTHER, SM-driven vdev_mgr_up_send(mlme_obj) path (which
+    #     this ad-hoc raw-WMI helper vdev was never properly registered
+    #     into) and hit that instead, then concluded VDEV_UP itself was
+    #     unsafe.
+    #
+    #     bssid is set to the helper vdev's own MAC (inj_mac) -- there is
+    #     no real AP, so "self-BSS" is the only meaningful choice, same
+    #     as how this vdev already identifies itself for vdev-create and
+    #     peer-create. assoc_id is 0, mirroring
+    #     wma_mon_mlme_vdev_up_send()'s identical no-real-association
+    #     case exactly.
+    #
+    #     Not independently re-verified: whether struct vdev_up_params is
+    #     already visible in this file without a new #include. It is
+    #     defined in the SAME header
+    #     (wlan_vdev_mgr_tgt_if_tx_defs.h) as vdev_start_params /
+    #     vdev_create_params / peer_create_params, which this exact
+    #     function already uses successfully (confirmed by v15/v16
+    #     compiling and running), so it is very likely already in scope
+    #     -- but this is an inference, not a direct grep hit on an
+    #     #include line in this file, and should be treated as the first
+    #     thing to check if the next build fails here (a one-line
+    #     #include fix, not a behavioral question).
+    f = WMA_SRC / "wma_frame_inject.c"
 
-def check_unaddressed_rejects():
-    """Flag any .rej that looks unaddressed in the final tree.
-
-    Originally this only checked whether the target FILE had any
-    hand-merge logic at all (ATTEMPTED_FILES) -- but that's too coarse: a
-    file can have working hand-merge logic for one hunk while a SEPARATE
-    hunk against the same file is silently dropped, because the file being
-    in ATTEMPTED_FILES (for the first hunk) hid the second hunk's reject
-    from ever being flagged. This happened for real: wma_utils.c had
-    correct hand-merge logic for its resp=alloc/use hunk, but a separate,
-    earlier hunk adding "struct del_bss_resp *resp;" had none -- its .rej
-    was swept away by cleanup() unflagged, and the gap only surfaced as a
-    live CI compile failure ('use of undeclared identifier resp').
-
-    So beyond the file-level check, for every remaining .rej whose target
-    file DOES have other hand-merge logic, check whether this specific
-    reject's own added ("+") lines actually made it into the final file
-    somewhere (regardless of exact position -- hand-merged text may
-    legitimately differ in whitespace/surroundings from the literal
-    reject). If most of a reject's added content is nowhere in the file,
-    it's very likely a hunk nothing has ever actually handled."""
-    for rej in sorted(WLAN_DIR.rglob("*.rej")):
-        rel = str(rej.relative_to(WLAN_DIR))
-        if rel in KNOWN_INAPPLICABLE_REJECTS:
-            print(f"[known-inapplicable] {rel} -- {KNOWN_INAPPLICABLE_REJECTS[rel]}")
-            continue
-        target = rej.with_suffix("").resolve()
-        if target not in ATTEMPTED_FILES:
-            FAILURES.append(
-                f"[unaddressed] {rej.relative_to(WLAN_DIR)} -- no hand-merge "
-                f"logic exists for this file yet, see dump_rejects() output "
-                f"above for ground truth"
-            )
-            continue
-        if not target.exists():
-            continue
-        rej_text = rej.read_text()
-        added_lines = [
-            l[1:].strip() for l in rej_text.split("\n")
-            if l.startswith("+") and not l.startswith("+++") and l[1:].strip()
-        ]
-        if not added_lines:
-            continue
-        target_text = target.read_text()
-        missing = [l for l in added_lines if l not in target_text]
-        # Slack for legitimately-reworded hand merges: only flag when a
-        # clear majority of THIS reject's added lines are nowhere in the
-        # file at all, not just absent at the reject's original position.
-        if len(missing) > len(added_lines) * 0.5:
-            FAILURES.append(
-                f"[unaddressed] {rej.relative_to(WLAN_DIR)} -- {target.name} "
-                f"has hand-merge logic for other hunks, but {len(missing)}/"
-                f"{len(added_lines)} of THIS reject's added lines are not "
-                f"present anywhere in the final file -- likely a hunk this "
-                f"script doesn't actually handle yet, see dump_rejects() "
-                f"output above for ground truth"
-            )
-
-
-def cleanup():
-    removed = 0
-    for pattern in ("*.rej", "*.orig"):
-        for p in QCACLD.rglob(pattern):
-            p.unlink()
-            removed += 1
-    if removed:
-        print(f"\nRemoved {removed} leftover .rej/.orig file(s) "
-              f"(see FAILED list below if any were never addressed)")
-
-
-def write_error_report():
-    """Write this run's outcome to a fixed, predictable path so CI can
-    archive it as a build artifact (via upload-artifact + if: always())
-    regardless of exit code. The terminal log is easy to lose or truncate
-    on a long build; this file isn't, and it's a stable target to wire an
-    upload step to without having to touch this script again later."""
-    report_path = REPO_ROOT / "injection_patch_report.log"
-    lines = []
-    if FAILURES:
-        lines.append(f"FAILED: {len(FAILURES)} hand-merge fix(es) did not apply:")
-        lines.extend(f"  - {msg}" for msg in FAILURES)
+    vdev_up_marker = "status = wmi_unified_vdev_up_send(wma->wmi_handle, inj_mac,"
+    if already_present(f, vdev_up_marker):
+        print("[wma_frame_inject.c ensure_tx_vdev: VDEV_UP] already present "
+              "-- skipping")
     else:
-        lines.append("All hunks applied or hand-merged successfully.")
-    report_path.write_text("\n".join(lines) + "\n")
-    print(f"\n[error report] wrote {report_path.relative_to(REPO_ROOT)}")
-
-
-def main():
-    run_bulk_patch()
-    dump_rejects()
-    apply_hand_merges()
-    check_unaddressed_rejects()
-    scan_for_duplicate_functions()
-    cleanup()
-    write_error_report()
-
-    print("\n" + "=" * 60)
-    if FAILURES:
-        print(f"FAILED: {len(FAILURES)} hand-merge fix(es) did not apply:")
-        for msg in FAILURES:
-            print(f"  - {msg}")
-        print(
-            "\nThis means the tree has drifted further since these fixes "
-            "were derived by hand against a specific snapshot. Re-check the "
-            "actual file content at the point of failure and update the "
-            "corresponding old_block/new_block in this script."
-        )
-        sys.exit(1)
-
-    print("All hunks applied or hand-merged successfully.")
-    print(
-        "Deliberately skipped (non-essential / real risk of breaking "
-        "tree-specific logic):\n"
-        "  - main.c wlan_off/on root-UID gating while monitor active\n"
-        "  - main.c HDD_FW_VER_SUB_ID macro fix (unrelated)\n"
-        "  - Kbuild -Wmaybe-uninitialized / -Wframe-larger-than block (unrelated)"
-    )
-
-
-if __name__ == "__main__":
-    main()
+        fuzzy_replace(
+            f,
+            "\t/*\n"
+            "\t * Skip VDEV_UP.  For STA vdevs, firmware's wlan_vdev_up\n"
+            "\t * asserts unless a BSS peer (the AP) exists — we only have\n"
+            "\t * a self-peer.  The mgmt TX handler only needs the vdev in\n"
+            "\t * STARTED state with a valid peer at vdev+0xc.\n"
+            "\t */\n"
+            "\n"
+            "\tg_inj_tx_vdev.created          = true;\n",
+            "\t{\n"
+            "\t\tstruct vdev_up_params vup;\n"
+            "\n"
+            "\t\tqdf_mem_zero(&vup, sizeof(vup));\n"
+            "\t\tvup.vdev_id = vid;\n"
+            "\t\t/*\n"
+            "\t\t * No real AP association exists for this self-peer-only\n"
+            "\t\t * helper vdev, so there is no AID.\n"
+            "\t\t * wma_mon_mlme_vdev_up_send() -- which brings up the\n"
+            "\t\t * real monitor vdev successfully on this exact hardwa

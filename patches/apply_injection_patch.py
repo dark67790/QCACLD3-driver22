@@ -122,11 +122,16 @@ def _normalize_for_match(block: str) -> str:
     Newlines are preserved as literal newlines (not relaxed), since we DO
     want to catch genuine structural differences in line breaks."""
     escaped = re.escape(block)
+    # re.escape turns each space/tab into a literal char; collapse any run
+    # of escaped horizontal whitespace into a flexible \s+ (but not \n).
     escaped = re.sub(r"(?:\\ |\\\t)+", r"[ \\t]+", escaped)
     return escaped
 
 
 def _diagnose(path: Path, needle: str, context_lines: int = 70):
+    """On an anchor miss, locate a much smaller near-certain substring and
+    dump real surrounding file content to the CI log, so we get ground
+    truth from a single run instead of a manual back-and-forth."""
     text = path.read_text()
     idx = text.find(needle)
     if idx == -1:
@@ -140,10 +145,16 @@ def _diagnose(path: Path, needle: str, context_lines: int = 70):
     print(f"    DIAGNOSE: needle found at line {line_no}, real content "
           f"(lines {start + 1}-{end}):")
     for i in range(start, end):
+        # render tabs visibly so indentation-only drift is obvious in the log
         print(f"    {i + 1:>6}\t{lines[i].replace(chr(9), '<TAB>')}")
 
 
 def already_present(path: Path, needle: str) -> bool:
+    """Idempotency check: some hunks succeed in the bulk patch step (possibly
+    landing correctly even when the hand-merge step's wider anchor doesn't
+    match due to surrounding tree-specific content). Check for the smallest
+    reliable signal before attempting a hand-merge, so already-applied work
+    isn't misreported as a failure."""
     ATTEMPTED_FILES.add(path.resolve())
     if not path.exists():
         return False
@@ -185,13 +196,18 @@ def fuzzy_replace(path: Path, old_block: str, new_block: str, label: str,
 
 
 def dump_rejects():
+    """Dump full ground-truth context for every remaining .rej file in one
+    pass: the literal expected hunk plus the real file's actual content at
+    that location. Runs after Step 1 so any NEW divergence (files we have
+    no hand-merge fix for yet) surfaces in this run's log instead of
+    requiring another manual round-trip."""
     rejects = sorted(WLAN_DIR.rglob("*.rej"))
     if not rejects:
         print("\n(no .rej files after bulk patch step -- nothing to diagnose)")
         return
     print(f"\n{'=' * 60}\nDIAGNOSING {len(rejects)} REMAINING .rej FILE(S)\n{'=' * 60}")
     for rej in rejects:
-        target = rej.with_suffix("")
+        target = rej.with_suffix("")  # strip trailing .rej
         print(f"\n--- {rej.relative_to(WLAN_DIR)} ---")
         rej_text = rej.read_text()
         print("EXPECTED (literal hunk from patch):")
@@ -219,6 +235,11 @@ KEYWORD_BLACKLIST = {
 
 
 def _extract_defs_from_added_lines(added_text: str):
+    """Given just the '+' lines of ONE hunk (already de-prefixed, in
+    order), find function definitions within that added block only.
+    Scoped to a single hunk's additions -- never the full file -- so
+    pre-existing #ifdef/#else branch-pairs elsewhere in the file never
+    enter into this at all."""
     lines = added_text.split("\n")
     names = []
     i, n = 0, len(lines)
@@ -256,6 +277,14 @@ def _extract_defs_from_added_lines(added_text: str):
 
 
 def get_patch_added_function_names():
+    """Parse the patch itself (not any target tree) to find the narrow,
+    specific list of function names it newly defines in EXISTING files
+    (files without 'new file mode' -- brand new files can't collide with
+    anything). Scoped to each hunk's own '+' lines only, which is what
+    keeps this accurate: we're asking 'what does the patch add', not
+    'find every function anywhere', so the vast pre-existing codebase
+    (full of legitimate #ifdef/#else same-name branch-pairs) never enters
+    into the analysis. Returns {relative_path: set(names)}."""
     patch_text = PATCH_FILE.read_text()
     parts = re.split(r"^diff --git a/(\S+) b/\S+$", patch_text, flags=re.M)
     pairs = list(zip(parts[1::2], parts[2::2]))
@@ -264,7 +293,7 @@ def get_patch_added_function_names():
         if not path.endswith(".c"):
             continue
         if "new file mode" in content[:500]:
-            continue
+            continue  # brand new file -- nothing pre-existing to collide with
         names = set()
         for hunk in re.split(r"^@@.*@@.*$", content, flags=re.M)[1:]:
             added = "\n".join(
@@ -279,8 +308,15 @@ def get_patch_added_function_names():
 
 
 def _build_condition_paths(text: str):
+    """For every line, compute the stack of (block_id, branch) identifying
+    which #if/#ifdef nesting it's inside. Two lines are only genuinely
+    mutually-exclusive if they share a common block_id but differ in
+    branch at that id -- NOT just because some #else exists somewhere
+    between them in the file (which could belong to a totally unrelated
+    conditional for a different feature entirely, especially across a
+    1000+ line gap)."""
     lines = text.split("\n")
-    stack = []
+    stack = []  # list of [block_id, branch]
     next_id = 0
     paths = {}
     for i, line in enumerate(lines, start=1):
@@ -302,11 +338,13 @@ def _mutually_exclusive(path_a, path_b):
     a_map, b_map = dict(path_a), dict(path_b)
     shared = set(a_map) & set(b_map)
     if not shared:
-        return False
+        return False  # no common conditional at all -- not exclusive
     return any(a_map[bid] != b_map[bid] for bid in shared)
 
 
 def _find_matching_paren(text: str, open_idx: int) -> int:
+    """text[open_idx] must be '('. Returns the index of its matching ')',
+    tracking nesting depth, or -1 if unbalanced before EOF."""
     depth = 0
     i = open_idx
     n = len(text)
@@ -322,6 +360,15 @@ def _find_matching_paren(text: str, open_idx: int) -> int:
 
 
 def _is_function_definition(text: str, open_paren_idx: int) -> bool:
+    """text[open_paren_idx] must be '('. A match is a genuine function
+    DEFINITION only if its parameter list's matching ')' is followed
+    (after only whitespace) by '{'. A call ends in ';' or ',' or ')'
+    inside a larger expression; a forward declaration ends in ';'.
+    Without this check, the duplicate-function scanner below false-flags
+    an ordinary call site (e.g. `hdd_monitor_mode_tx_inject(adapter, dev,
+    skb);`) as a second definition, since the scan regex only looks for
+    "name(" at the start of a non-comment line and doesn't care what
+    follows the closing paren."""
     close_idx = _find_matching_paren(text, open_paren_idx)
     if close_idx == -1:
         return False
@@ -333,6 +380,13 @@ def _is_function_definition(text: str, open_paren_idx: int) -> bool:
 
 
 def _delete_function_by_doc_marker(path: Path, doc_marker: str, label: str) -> bool:
+    """Delete one complete function definition, located structurally
+    instead of by a literal transcription of its full body: find the
+    short, distinctive doc_marker inside its kernel-doc comment, walk
+    back to that comment's opening '/**', walk forward to the function's
+    opening '{', then brace-balance to the matching closing '}' and
+    delete everything from the comment through that brace (plus one
+    trailing blank line, if present)."""
     ATTEMPTED_FILES.add(path.resolve())
     if not path.exists():
         FAILURES.append(f"[{label}] file not found: {path}")
@@ -379,6 +433,8 @@ def _delete_function_by_doc_marker(path: Path, doc_marker: str, label: str) -> b
             f"never balanced -- refusing to guess, needs a human")
         return False
 
+    # Consume up to one trailing blank line after the closing brace so we
+    # don't leave a double blank line behind.
     end = brace_close + 1
     if text[end:end + 1] == "\n":
         end += 1
@@ -395,6 +451,10 @@ def _delete_function_by_doc_marker(path: Path, doc_marker: str, label: str) -> b
 
 
 def _diagnose_duplicate(path: Path, name: str, lines_list, context_lines: int = 24):
+    """Dump real context around each occurrence of a duplicated function name,
+    the same way _diagnose() does for a missed .rej anchor, so a genuine new
+    divergence (one this script has no hand-merge logic for yet) gets ground
+    truth in this run's log instead of requiring a guessed fix."""
     lines = path.read_text().splitlines()
     for ln in lines_list:
         lo = max(0, ln - 1 - context_lines // 2)
@@ -406,6 +466,11 @@ def _diagnose_duplicate(path: Path, name: str, lines_list, context_lines: int = 
 
 
 def scan_for_duplicate_functions():
+    """For the narrow, patch-derived list of function names (see
+    get_patch_added_function_names), check whether the FINAL merged file
+    defines each name more than once -- and if so, whether the two
+    definitions sit in mutually-exclusive #ifdef/#else branches (legal,
+    normal kernel style, not a bug) versus truly both being live."""
     print(f"\n{'=' * 60}\nSCANNING FOR DUPLICATE FUNCTION DEFINITIONS\n{'=' * 60}")
     name_map = get_patch_added_function_names()
     total_names = sum(len(v) for v in name_map.values())
@@ -427,7 +492,7 @@ def scan_for_duplicate_functions():
                 r"[\w \t\*]*?\b" + re.escape(name) + r"[ \t]*\(", re.M)
             match_lines = []
             for m in pattern.finditer(text):
-                open_paren_idx = m.end() - 1
+                open_paren_idx = m.end() - 1  # pattern consumes the '(' itself
                 if (text[open_paren_idx] == "("
                         and _is_function_definition(text, open_paren_idx)):
                     match_lines.append(text.count("\n", 0, m.start()) + 1)
@@ -458,15 +523,20 @@ def scan_for_duplicate_functions():
 def apply_hand_merges():
     print("\n== Step 2: hand-merged fixes for hunks that diverged from baseline ==")
 
+    # --- rx_monitor.h : hdd_disable_monitor_mode(void) already exists
+    #     natively in this tree (confirmed: declared at the prototype AND
+    #     stub, called from main.c with no args) ---
     f = HDD_SRC / "wlan_hdd_rx_monitor.h"
     if already_present(f, "hdd_disable_monitor_mode("):
-        print("[rx_monitor.h] hdd_disable_monitor_mode already present -- correctly left alone")
+        print("[rx_monitor.h] hdd_disable_monitor_mode already present "
+              "(this tree's own, unrelated function) -- correctly left alone")
     else:
         msg = ("[rx_monitor.h] expected hdd_disable_monitor_mode to already "
                "exist in this tree and it doesn't -- tree has changed more "
                "than expected, needs a human to re-check")
         FAILURES.append(msg)
 
+    # --- rx_monitor.c : conditional include ---
     f = HDD_SRC / "wlan_hdd_rx_monitor.c"
     if already_present(f, '#include "wlan_hdd_frame_inject.h"'):
         print("[rx_monitor.c include] already present -- skipping")
@@ -479,6 +549,7 @@ def apply_hand_merges():
             "rx_monitor.c include",
             diagnose_needle='#include "wlan_hdd_rx_monitor.h"')
 
+    # --- rx_monitor.c : remove duplicate hdd_disable_monitor_mode(dev) and splice ---
     splice_marker = "hdd_get_adapter(hdd_ctx, QDF_MONITOR_MODE)"
     dup_marker = "int hdd_disable_monitor_mode(struct net_device *dev)"
     void_fn = (
@@ -564,6 +635,7 @@ def apply_hand_merges():
                       "rx_monitor.c splice into existing fn (no duplicate present)",
                       diagnose_needle="int hdd_disable_monitor_mode(void)")
 
+    # --- cfg80211.c : conditional include + vendor cmd array entry ---
     f = HDD_SRC / "wlan_hdd_cfg80211.c"
     fuzzy_replace(f,
         '#include "wlan_hdd_cfr.h"\n',
@@ -582,6 +654,7 @@ def apply_hand_merges():
         "#endif\n",
         "cfg80211.c vendor cmd array")
 
+    # --- wlan_hdd_frame_inject.h : vendor command .policy fix ---
     f = HDD_INC / "wlan_hdd_frame_inject.h"
     vendor_cmds_old = (
         "#define FEATURE_FRAME_INJECTION_VENDOR_COMMANDS \\\n"
@@ -637,13 +710,15 @@ def apply_hand_merges():
         "}\n"
     )
     if already_present(f, "\t.policy = VENDOR_CMD_RAW_DATA, \\\n\t.doit = hdd_frame_inject_netlink"):
-        print("[wlan_hdd_frame_inject.h vendor cmd .policy] already present -- skipping")
+        print("[wlan_hdd_frame_inject.h vendor cmd .policy] already present "
+              "-- skipping")
     else:
         fuzzy_replace(
             f, vendor_cmds_old, vendor_cmds_new,
             "wlan_hdd_frame_inject.h add missing .policy to vendor commands",
             diagnose_needle="define FEATURE_FRAME_INJECTION_VENDOR_COMMANDS")
 
+    # --- main.h : injection_ctx field ---
     f = HDD_INC / "wlan_hdd_main.h"
     if already_present(f, "struct hdd_injection_ctx *injection_ctx;"):
         print("[main.h injection_ctx field] already present -- skipping")
@@ -656,6 +731,7 @@ def apply_hand_merges():
             "main.h injection_ctx field",
             diagnose_needle="net_dev_hold_ref_count[NET_DEV_HOLD_ID_MAX]")
 
+    # --- main.c : __hdd_mon_open ---
     f = HDD_SRC / "wlan_hdd_main.c"
     fuzzy_replace(f,
         "\tret = hdd_set_mon_rx_cb(dev);\n\n"
@@ -690,6 +766,7 @@ def apply_hand_merges():
         "\treturn 0;\n}",
         "main.c __hdd_mon_open")
 
+    # --- wma.h : legacy WMA_LOGE/W/D/I macro compatibility shim ---
     f = WMA_INC / "wma.h"
     wma_log_macros = (
         "#define wma_alert(params...) QDF_TRACE_FATAL(QDF_MODULE_ID_WMA, params)\n"
@@ -718,6 +795,7 @@ def apply_hand_merges():
                       "wma.h legacy WMA_LOGE/W/D/I shim",
                       diagnose_needle="#define wma_err_rl(params...)")
 
+    # --- wma_main.c : wma_open ---
     f = WMA_SRC / "wma_main.c"
     fuzzy_replace(f,
         "\twma_register_mws_coex_events(wma_handle);\n"
@@ -733,6 +811,7 @@ def apply_hand_merges():
         "\t}\n\n\treturn QDF_STATUS_SUCCESS;",
         "wma_main.c wma_open injection queue init")
 
+    # --- wma_utils.c : wma_mon_mlme_vdev_down_send del_bss_resp fixes ---
     f = WMA_SRC / "wma_utils.c"
     down_send_decl_anchor = (
         "QDF_STATUS wma_mon_mlme_vdev_down_send(struct vdev_mlme_obj *vdev_mlme,\n"
@@ -754,7 +833,8 @@ def apply_hand_merges():
     )
 
     if already_present(f, down_send_decl_fixed):
-        print("[wma_utils.c del_bss_resp declaration] already present in wma_mon_mlme_vdev_down_send -- skipping")
+        print("[wma_utils.c del_bss_resp declaration] already present in "
+              "wma_mon_mlme_vdev_down_send -- skipping")
     else:
         if already_present(f, wlm_stats_misplaced_anchor):
             fuzzy_replace(
@@ -781,15 +861,18 @@ def apply_hand_merges():
         "\t}\n\n\treturn status;",
         "wma_utils.c del_bss_resp alloc")
 
+    # --- wma_frame_inject.c : fix field mismatches ---
     f = WMA_SRC / "wma_frame_inject.c"
     roam_check_old = "\tif (iface->roaming_in_progress) {\n"
     roam_check_new = "\tif (wma_is_roam_in_progress(vdev_id)) {\n"
     if already_present(f, roam_check_new):
-        print("[wma_frame_inject.c roaming_in_progress fix] already present -- skipping")
+        print("[wma_frame_inject.c roaming_in_progress fix] already present "
+              "-- skipping")
     else:
         fuzzy_replace(
             f, roam_check_old, roam_check_new,
-            "wma_frame_inject.c roaming_in_progress -> wma_is_roam_in_progress(vdev_id)",
+            "wma_frame_inject.c roaming_in_progress -> "
+            "wma_is_roam_in_progress(vdev_id)",
             diagnose_needle="if (iface->roaming_in_progress")
 
     mhz_old = (
@@ -807,6 +890,7 @@ def apply_hand_merges():
                       "wma_frame_inject.c .mhz -> .ch_freq",
                       diagnose_needle="interfaces[vdev_id].mhz")
 
+    # --- wlan_hdd_inject_security.c : dead cred fetch removal ---
     f = HDD_SRC / "wlan_hdd_inject_security.c"
     inject_cap_old = (
         "\tconst struct cred *cred;\n"
@@ -847,13 +931,15 @@ def apply_hand_merges():
         "\tif (!has_capability) {\n"
     )
     if already_present(f, inject_cap_new) and not already_present(f, "cred = get_task_cred(task);"):
-        print("[wlan_hdd_inject_security.c dead cred fetch] already removed -- skipping")
+        print("[wlan_hdd_inject_security.c dead cred fetch] already removed "
+              "-- skipping")
     else:
         fuzzy_replace(
             f, inject_cap_old, inject_cap_new,
             "wlan_hdd_inject_security.c remove dead get_task_cred/put_cred",
             diagnose_needle="QDF_STATUS hdd_check_injection_capability(struct task_struct *task)")
 
+    # --- Kbuild : wire new objects + cppflags ---
     f = QCACLD / "Kbuild"
     if already_present(f, "CONFIG_FEATURE_FRAME_INJECTION_SUPPORT), y)"):
         print("[Kbuild] already present -- skipping")
@@ -903,6 +989,7 @@ def apply_hand_merges():
             "Kbuild cppflags",
             diagnose_needle="cppflags-y += -DDISABLE_MON_CONFIG")
 
+    # --- cfg80211.c : duplicate get_channel dedup ---
     f = HDD_SRC / "wlan_hdd_cfg80211.c"
     patch_get_channel_marker = "so that tools like aireplay-ng / mdk3 can determine the current channel."
     if not already_present(f, patch_get_channel_marker):
@@ -923,6 +1010,7 @@ def apply_hand_merges():
             "cfg80211.c remove duplicate .get_channel struct entry",
             diagnose_needle=".set_monitor_channel = wlan_hdd_cfg80211_set_mon_ch,")
 
+    # --- default_defconfig : enable injection flag ---
     f = CONFIGS / "default_defconfig"
     fuzzy_replace(f,
         "CONFIG_FEATURE_MONITOR_MODE_SUPPORT := y\n",
@@ -930,6 +1018,7 @@ def apply_hand_merges():
         "CONFIG_FEATURE_FRAME_INJECTION_SUPPORT := y\n",
         "default_defconfig injection flag")
 
+    # --- qca_vendor.h : ant_div relocation ---
     f = WLAN_DIR / "qca-wifi-host-cmn/os_if/linux/qca_vendor.h"
     six_entries_block = (
         "\n"
@@ -980,9 +1069,13 @@ def apply_hand_merges():
         "\t * attribute specifies the number of WLAN probes.")
 
     if already_present(f, short_fixed_marker):
-        print("[qca_vendor.h ant_div relocation] already in the correct enum -- skipping")
+        print("[qca_vendor.h ant_div relocation] already in the correct "
+              "enum (qca_wlan_vendor_attr_config) -- skipping")
     elif not already_present(f, short_misplaced_marker):
-        msg = ("[qca_vendor.h ant_div relocation] six-entry block not found -- needs a human")
+        msg = ("[qca_vendor.h ant_div relocation] six-entry block not found "
+               "at its known-wrong location (acs_offload's tail) and not "
+               "found at the correct location either -- tree has drifted "
+               "further than expected, needs a human to re-check")
         FAILURES.append(msg)
         _diagnose(f, "QCA_WLAN_VENDOR_ATTR_CONFIG_ANT_DIV_PROBE_COUNT_WLAN")
     else:
@@ -1012,6 +1105,7 @@ def apply_hand_merges():
                 "qca_vendor.h insert ant_div block into qca_wlan_vendor_attr_config",
                 diagnose_needle="QCA_WLAN_VENDOR_ATTR_CONFIG_ARP_NS_OFFLOAD = 81,")
 
+    # --- tx_rx.c : radiotap include ---
     f = HDD_SRC / "wlan_hdd_tx_rx.c"
     radiotap_include_tail = (
         '#include "wlan_hdd_frame_inject.h"\n'
@@ -1027,6 +1121,7 @@ def apply_hand_merges():
             "tx_rx.c radiotap include",
             diagnose_needle='#include "wlan_hdd_frame_inject.h"')
 
+    # --- tx_rx.c : __hdd_hard_start_xmit relocation ---
     xmit_probe_block = (
         "\tstatic bool xmit_probe_logged;\n"
         "\n"
@@ -1062,9 +1157,13 @@ def apply_hand_merges():
     )
 
     if already_present(f, xmit_probe_fixed_marker):
-        print("[tx_rx.c xmit_probe relocation] already in __hdd_hard_start_xmit -- skipping")
+        print("[tx_rx.c xmit_probe relocation] already in "
+              "__hdd_hard_start_xmit -- skipping")
     elif not already_present(f, xmit_probe_misplaced_marker):
-        msg = ("[tx_rx.c xmit_probe relocation] block not found -- needs a human")
+        msg = ("[tx_rx.c xmit_probe relocation] block not found at its "
+               "known-wrong location (hdd_register_rx_ol_cb) and not found "
+               "at the correct location either -- tree has drifted further "
+               "than expected, needs a human to re-check")
         FAILURES.append(msg)
         _diagnose(f, "xmit_probe_logged")
     else:
@@ -1080,9 +1179,12 @@ def apply_hand_merges():
                 f,
                 xmit_probe_decl_end + xmit_probe_ftm_guard,
                 xmit_probe_fixed_marker,
-                "tx_rx.c insert xmit_probe block into __hdd_hard_start_xmit",
+                "tx_rx.c insert xmit_probe block into __hdd_hard_start_xmit "
+                "(after last declaration, before first statement)",
                 diagnose_needle="int cpu = qdf_get_smp_processor_id();")
 
+    # --- tx_rx.c : wlan_hdd_netif_queue_control ---
+    f = HDD_SRC / "wlan_hdd_tx_rx.c"
     fuzzy_replace(f,
         "\tuint32_t temp_map;\n\tuint8_t index;\n"
         "\tstruct hdd_netif_queue_history *txq_hist_ptr;\n\n"
@@ -1109,6 +1211,7 @@ def apply_hand_merges():
         "\t\t\t    adapter->pause_map, current->comm);\n\t}\n\n\tswitch (action) {",
         "tx_rx.c netif_queue_control monitor guard")
 
+    # --- wlan_hdd_main.h : mon_ch_switch_in_progress ---
     f = HDD_INC / "wlan_hdd_main.h"
     fuzzy_replace(
         f,
@@ -1120,7 +1223,10 @@ def apply_hand_merges():
         "main.h mon_ch_switch_in_progress field",
         diagnose_needle="qdf_atomic_t ch_switch_in_progress;")
 
+    # --- wlan_hdd_cfg80211.c : __wlan_hdd_cfg80211_set_mon_ch hops synchronization ---
     f = HDD_SRC / "wlan_hdd_cfg80211.c"
+
+    # Hunk 1: acquire guard + skip redundant hw-mode renegotiation
     fuzzy_replace(
         f,
         "\tch_params.ch_width = ch_width;\n"
@@ -1154,6 +1260,7 @@ def apply_hand_merges():
         "cfg80211.c set_mon_ch: acquire guard + DBS skip-check",
         diagnose_needle="if (wlan_hdd_change_hw_mode_for_given_chnl(adapter,")
 
+    # Hunk 2: release guard on vdev-up-in-progress return
     fuzzy_replace(
         f,
         "\tif (adapter->monitor_mode_vdev_up_in_progress) {\n"
@@ -1168,6 +1275,7 @@ def apply_hand_merges():
         "cfg80211.c set_mon_ch: release guard on vdev-up-in-progress return",
         diagnose_needle="monitor mode vdev up in progress")
 
+    # Hunk 3: release guard on event-reset failure
     fuzzy_replace(
         f,
         "\tstatus = qdf_event_reset(&adapter->qdf_monitor_mode_vdev_up_event);\n"
@@ -1184,6 +1292,7 @@ def apply_hand_merges():
         "cfg80211.c set_mon_ch: release guard on event-reset failure",
         diagnose_needle="failed to reinit monitor mode vdev up event")
 
+    # Hunk 4: release guard on roam-channel-change failure
     fuzzy_replace(
         f,
         "\tstatus = sme_roam_channel_change_req(mac_handle, bssid,\n"
@@ -1212,6 +1321,7 @@ def apply_hand_merges():
         "cfg80211.c set_mon_ch: release guard on roam-channel-change failure",
         diagnose_needle="Failed to set sme_RoamChannel for monitor mode")
 
+    # Hunk 5: release guard on timeout + success paths
     fuzzy_replace(
         f,
         "\t\telse\n"
@@ -1250,6 +1360,7 @@ def apply_hand_merges():
         "cfg80211.c set_mon_ch: release guard on timeout + success paths",
         diagnose_needle="Failed monitor mode vdev up(status-%d)")
 
+    # --- wma_frame_inject.c : ensure_tx_vdev recreate only on band change ---
     f = WMA_SRC / "wma_frame_inject.c"
     fuzzy_replace(
         f,
@@ -1282,9 +1393,11 @@ def apply_hand_merges():
         "wma_frame_inject.c ensure_tx_vdev: only recreate on band change",
         diagnose_needle="g_inj_tx_vdev.created) {")
 
+    # --- wma_frame_inject.c : ensure_tx_vdev send VDEV_UP ---
     vdev_up_marker = "status = wmi_unified_vdev_up_send(wma->wmi_handle, inj_mac,"
     if already_present(f, vdev_up_marker):
-        print("[wma_frame_inject.c ensure_tx_vdev: VDEV_UP] already present -- skipping")
+        print("[wma_frame_inject.c ensure_tx_vdev: VDEV_UP] already present "
+              "-- skipping")
     else:
         fuzzy_replace(
             f,
@@ -1297,38 +1410,70 @@ def apply_hand_merges():
             "\n"
             "\tg_inj_tx_vdev.created          = true;\n",
             "\t{\n"
-            "\t\tQDF_STATUS status;\n"
+            "\t\tstruct vdev_up_params vup;\n"
             "\n"
+            "\t\tqdf_mem_zero(&vup, sizeof(vup));\n"
+            "\t\tvup.vdev_id = vid;\n"
             "\t\t/*\n"
             "\t\t * No real AP association exists for this self-peer-only\n"
             "\t\t * helper vdev, so there is no AID.\n"
             "\t\t * wma_mon_mlme_vdev_up_send() -- which brings up the\n"
-            "\t\t * real monitor vdev successfully on this exact hardware\n"
-            "\t\t * right now -- calls vdev_mgr_up_send() with assoc_id\n"
-            "\t\t * forced to 0, no peer check anywhere in that path.\n"
+            "\t\t * real monitor vdev successfully on this exact hardware --\n"
+            "\t\t * passes assoc_id = 0 for the same reason.\n"
             "\t\t */\n"
-            "\t\tstatus = wmi_unified_vdev_up_send(wma->wmi_handle, inj_mac,\n"
-            "\t\t\t\t\t\t\t\t  vid, 0, 0);\n"
+            "\t\tvup.assoc_id = 0;\n"
+            "\t\tstatus = wmi_unified_vdev_up_send(wma->wmi_handle, inj_mac, &vup);\n"
             "\t\tif (QDF_IS_STATUS_ERROR(status)) {\n"
-            "\t\t\tWMA_LOGE(\"%s: Failed to send VDEV_UP for injection vdev: %d\",\n"
-            "\t\t\t\t __func__, status);\n"
+            "\t\t\tWMA_LOGE(\"%s: Failed to send VDEV_UP: %d\", __func__, status);\n"
+            "\t\t\treturn status;\n"
             "\t\t}\n"
             "\t}\n"
             "\n"
-            "\tg_inj_tx_vdev.created = true;\n",
+            "\tg_inj_tx_vdev.created          = true;\n",
             "wma_frame_inject.c ensure_tx_vdev: send VDEV_UP",
-            diagnose_needle="Skip VDEV_UP."
-        )
+            diagnose_needle="Skip VDEV_UP")
+
+
+def check_unaddressed_rejects():
+    print(f"\n{'=' * 60}\nCHECKING FOR UNADDRESSED REJECTS\n{'=' * 60}")
+    rejects = sorted(WLAN_DIR.rglob("*.rej"))
+    if not rejects:
+        print("No .rej files found — tree is clean.")
+        return
+
+    for rej in rejects:
+        rel_str = str(rej.relative_to(WLAN_DIR))
+        if rel_str in KNOWN_INAPPLICABLE_REJECTS:
+            print(f"[known-inapplicable] {rel_str}:\n  {KNOWN_INAPPLICABLE_REJECTS[rel_str]}\n")
+            continue
+
+        target = rej.with_suffix("")
+        if target.resolve() not in ATTEMPTED_FILES:
+            msg = (f"[unaddressed-reject] {rel_str} exists and target file {target.name} "
+                   f"has NO hand-merge logic in this script")
+            FAILURES.append(msg)
+            print(f"  !! {msg}")
+        else:
+            msg = (f"[unaddressed-reject] {rel_str} has remaining reject hunks after hand-merges")
+            FAILURES.append(msg)
+            print(f"  !! {msg}")
+
+
+def main():
+    run_bulk_patch()
+    dump_rejects()
+    apply_hand_merges()
+    scan_for_duplicate_functions()
+    check_unaddressed_rejects()
+
+    if FAILURES:
+        print(f"\n{'=' * 60}\nFAILED WITH {len(FAILURES)} ERROR(S):\n{'=' * 60}")
+        for i, failure in enumerate(FAILURES, 1):
+            print(f"{i:>2}. {failure}")
+        sys.exit(1)
+
+    print(f"\n{'=' * 60}\nALL PATCHES AND HAND-MERGES APPLIED CLEANLY\n{'=' * 60}")
 
 
 if __name__ == "__main__":
-    run_bulk_patch()
-    apply_hand_merges()
-    scan_for_duplicate_functions()
-    dump_rejects()
-    if FAILURES:
-        print(f"\n{'=' * 60}\nFATAL: {len(FAILURES)} hand-merge/validation failure(s):\n{'=' * 60}")
-        for msg in FAILURES:
-            print(f"  - {msg}")
-        sys.exit(1)
-    print(f"\n{'=' * 60}\nSUCCESS: All patches and hand-merges applied cleanly!\n{'=' * 60}")
+    main()
